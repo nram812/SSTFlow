@@ -1,0 +1,9 @@
+#!/bin/bash
+#PBS -N sst-cpu-tests
+#PBS -q shortq
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -l walltime=02:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+pixi run test

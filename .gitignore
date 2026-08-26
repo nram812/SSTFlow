@@ -1,0 +1,13 @@
+.pixi/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+derived/
+reports/
+runs/
+logs/
+*.o[0-9]*
+*.e[0-9]*
+sst_10km_OFAM_historical_Australia.nc
+Untitled.ipynb

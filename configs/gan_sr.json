@@ -1,0 +1,60 @@
+{
+  "name": "gan_sr",
+  "description": "Conditional GAN super-resolution with a single-sample masked MSE content loss",
+  "model_kind": "gan",
+
+  "source_path": "/esi/project/niwa03712/rampaln/PUBLICATIONS/2026/SSTDownscaling/sst_10km_OFAM_historical_Australia.nc",
+  "derived_path": "derived/sst_downscaling_f16.nc",
+  "normalization_cache": "reports/normalization_f16.json",
+  "output_dir": "runs/gan_sr",
+  "smoke_output_dir": "runs/smoke/gan_sr",
+
+  "coarsen_factor": 16,
+  "min_valid_fraction": 0.5,
+
+  "train_date_ranges": [["1979-01-01", "2008-12-31"]],
+  "validation_date_ranges": [["2009-01-01", "2010-12-31"]],
+  "test_date_ranges": [["2011-01-01", "2014-12-31"]],
+  "smoke_date_ranges": [["1979-01-01", "1979-01-31"]],
+
+  "base_channels": 32,
+  "levels": 4,
+  "condition_channels": 2,
+  "target_channels": 1,
+  "noise_channels": 4,
+  "attention": true,
+  "attention_heads": 4,
+  "generator_residual": true,
+  "discriminator_base_channels": 32,
+  "discriminator_levels": 4,
+
+  "batch_size": 8,
+  "num_workers": 4,
+  "preload": false,
+  "learning_rate": 0.0001,
+  "discriminator_learning_rate": 0.0001,
+  "weight_decay": 0.00001,
+  "ema_decay": 0.999,
+  "warmup_steps": 500,
+  "min_learning_rate_factor": 0.05,
+  "gradient_clip": 1.0,
+  "seed": 42,
+
+  "critic_steps": 1,
+  "lambda_content": 10.0,
+  "lambda_adversarial": 1.0,
+  "adversarial_start_step": 2000,
+
+  "max_steps": 120000,
+  "max_runtime_hours": 23.0,
+  "log_every": 50,
+  "validation_every": 2000,
+  "preview_every": 1000,
+  "netcdf_every": 5000,
+  "checkpoint_every": 2000,
+
+  "validation_samples": 8,
+  "preview_samples": 4,
+
+  "lambda_conservation": 0.0
+}

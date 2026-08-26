@@ -1,0 +1,66 @@
+{
+  "name": "flow_ar",
+  "description": "Autoregressive flow-matching super-resolution with a differentiable single-step rollout",
+  "model_kind": "autoregressive",
+
+  "source_path": "/esi/project/niwa03712/rampaln/PUBLICATIONS/2026/SSTDownscaling/sst_10km_OFAM_historical_Australia.nc",
+  "derived_path": "derived/sst_downscaling_f16.nc",
+  "normalization_cache": "reports/normalization_f16.json",
+  "output_dir": "runs/flow_ar",
+  "smoke_output_dir": "runs/smoke/flow_ar",
+
+  "coarsen_factor": 16,
+  "min_valid_fraction": 0.5,
+
+  "train_date_ranges": [["1979-01-01", "2008-12-31"]],
+  "validation_date_ranges": [["2009-01-01", "2010-12-31"]],
+  "test_date_ranges": [["2011-01-01", "2014-12-31"]],
+  "smoke_date_ranges": [["1979-01-01", "1979-01-31"]],
+
+  "base_channels": 32,
+  "levels": 4,
+  "condition_channels": 2,
+  "target_channels": 1,
+  "attention": true,
+  "attention_heads": 4,
+  "lag_base_channels": 16,
+  "lag_dropout": 0.1,
+  "lag_path_dropout": 0.1,
+
+  "horizon": 1,
+  "batch_size": 4,
+  "rollout_batch_size": 2,
+  "num_workers": 4,
+  "preload": false,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.00001,
+  "ema_decay": 0.999,
+  "warmup_steps": 500,
+  "min_learning_rate_factor": 0.05,
+  "gradient_clip": 1.0,
+  "seed": 42,
+
+  "max_steps": 120000,
+  "max_runtime_hours": 23.0,
+  "log_every": 50,
+  "validation_every": 2000,
+  "preview_every": 1000,
+  "netcdf_every": 5000,
+  "checkpoint_every": 2000,
+  "rollout_netcdf_every": 10000,
+
+  "rollout_weight": 0.1,
+  "rollout_start_step": 20000,
+  "rollout_every": 4,
+  "rollout_train_steps": 4,
+  "rollout_days": 10,
+  "rollout_sampler_steps": 25,
+
+  "sampler": "heun",
+  "validation_sampler_steps": 10,
+  "preview_sampler_steps": 25,
+  "validation_samples": 8,
+  "preview_samples": 4,
+
+  "lambda_conservation": 0.0
+}

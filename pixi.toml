@@ -1,0 +1,56 @@
+[workspace]
+name = "sst-downscaling"
+version = "0.1.0"
+description = "Flow matching, autoregressive flow matching, and GAN super-resolution of OFAM sea-surface temperature"
+channels = ["conda-forge"]
+platforms = [{ platform = "linux-64", cuda = "12" }]
+
+# Shared, hardware independent dependencies.  PyTorch itself is pulled in by the
+# `cpu` / `gpu` features below because the login nodes on this cluster do not
+# expose a CUDA driver and therefore cannot resolve `pytorch-gpu`.
+[dependencies]
+python = ">=3.11,<3.13"
+numpy = ">=1.26,<3"
+scipy = ">=1.11,<2"
+xarray = ">=2024.1"
+netcdf4 = ">=1.6,<2"
+h5netcdf = ">=1.3,<2"
+h5py = ">=3.10,<4"
+dask = ">=2024.1"
+matplotlib = ">=3.8,<4"
+tqdm = ">=4.66,<5"
+pytest = ">=8,<9"
+
+[feature.cpu.dependencies]
+pytorch-cpu = ">=2.5,<3"
+
+[feature.gpu.dependencies]
+pytorch-gpu = ">=2.5,<3"
+
+[environments]
+default = { features = ["cpu"], solve-group = "cpu" }
+gpu = { features = ["gpu"], solve-group = "gpu" }
+
+[tasks]
+# --- validation (CPU, login node or shortq) -----------------------------
+test = { cmd = "python -m pytest tests -v", env = { PYTHONPATH = "src", MPLBACKEND = "Agg", OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
+test-fast = { cmd = "python -m pytest tests -v -m 'not slow'", env = { PYTHONPATH = "src", MPLBACKEND = "Agg", OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
+validate-data = { cmd = "python -u src/validate_data.py --config configs/flow_sr.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+
+# --- data preparation ---------------------------------------------------
+preprocess = { cmd = "python -u src/preprocess.py --config configs/flow_sr.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+
+# --- smoke tests (a handful of optimiser steps) -------------------------
+smoke-flow = { cmd = "python -u src/train_flow.py --config configs/flow_sr.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+smoke-flow-ar = { cmd = "python -u src/train_flow_ar.py --config configs/flow_ar.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+smoke-gan = { cmd = "python -u src/train_gan.py --config configs/gan_sr.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+
+# --- production training (submit through jobs/*.pbs) --------------------
+train-flow = { cmd = "python -u src/train_flow.py --config configs/flow_sr.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+train-flow-ar = { cmd = "python -u src/train_flow_ar.py --config configs/flow_ar.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+train-gan = { cmd = "python -u src/train_gan.py --config configs/gan_sr.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+
+# --- evaluation ---------------------------------------------------------
+evaluate-flow = { cmd = "python -u src/evaluate.py --run runs/flow_sr", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+evaluate-flow-ar = { cmd = "python -u src/evaluate.py --run runs/flow_ar", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+evaluate-gan = { cmd = "python -u src/evaluate.py --run runs/gan_sr", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }

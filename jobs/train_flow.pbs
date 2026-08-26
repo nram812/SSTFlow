@@ -1,0 +1,11 @@
+#!/bin/bash
+#PBS -N sst-flow
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+pixi run -e gpu train-flow
+status=$(pixi run python -c 'import json; print(json.load(open("runs/flow_sr/status.json"))["status"])')
+if [[ "$status" == checkpointed ]]; then qsub jobs/train_flow.pbs; fi
