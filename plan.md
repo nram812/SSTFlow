@@ -274,8 +274,8 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] **B8** Real preprocessing complete: mean 19.833256 °C, std 8.699326 °C, 32 × 32 coarse grid, 716 valid coarse cells.
 - [x] **B9** Full CPU suite green: 102 passed in 9.50 s with CPU thread counts bounded to one for deterministic throughput.
 - [x] **B10** Real-grid CPU smoke training complete for all three models (3 steps each); every run produced PNG, NetCDF, checkpoint, weights, history, and passing status. AR rollout and GAN adversarial paths were exercised.
-- [ ] **B11** Run a **GPU smoke test on `h200q`**: forward/backward at production batch size, peak-memory report, sampler timing, and a real NetCDF product. Job `6406137` submitted after fixing the launch environment; awaiting its result.
-- [ ] **B12** `README.md` and `AGENTS.md`; `.gitignore`; `git init` and an initial commit. Files and repository are created; initial commit remains.
+- [x] **B11** GPU smoke passed on an NVIDIA H200 in job `6406137`: production-batch forward/backward for all models, 11.93 GiB maximum peak allocation, 25-step Heun in 1.91 s, 10-day AR rollout in 19.34 s, and a verified NetCDF product.
+- [x] **B12** `README.md`, `AGENTS.md`, `.gitignore`, Git repository, and initial commit `8c0bb9c` created.
 
 ## PART C — Exhaustive test matrix
 
@@ -439,7 +439,7 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 - [x] Whole `pixi run test` suite green on CPU (102 passed, 2026-08-26).
 - [x] `pixi run validate-data` green on the real file (all nine checks passed).
 - [x] All three CPU smoke trainings produce PNG + NetCDF + checkpoint.
-- [ ] `jobs/gpu_smoke.pbs` completes on h200q within its walltime and fits in memory.
+- [x] `jobs/gpu_smoke.pbs` completes on h200q within its walltime and fits in memory (job `6406137`, peak 11.93 GiB).
 - [ ] Flow-matching validation RMSE beats bilinear upsampling of the coarse field.
 - [ ] Autoregressive `skill_vs_persistence > 0` (otherwise re-tune `lag_path_dropout`).
 - [ ] GAN content loss decreases and the critic logits stay bounded (no divergence).
