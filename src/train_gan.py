@@ -38,6 +38,12 @@ from model_gan import build_discriminator, build_generator
 DATASET_KIND = "super_resolution"
 
 
+def set_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
+    """Freeze/unfreeze a player without blocking gradients to its inputs."""
+    for parameter in module.parameters():
+        parameter.requires_grad_(enabled)
+
+
 @torch.no_grad()
 def validation_metrics(
     generator_module, dataset, device, normalization, derived, config, seed: int
@@ -234,6 +240,11 @@ def train(
         loss = lambda_content * content_loss
         record["content"] = float(content_loss.detach())
         if adversarial:
+            # The critic supplies d(score)/d(generated), but its own parameters
+            # must not receive generator-loss gradients. Leaving those grads
+            # in place contaminates the next critic update with the opposite
+            # objective and drives both real/fake logits upward.
+            set_requires_grad(discriminator, False)
             adversarial_loss = hinge_generator_loss(
                 discriminator(generated, batch["condition"], batch["mask"])
             )
@@ -248,6 +259,9 @@ def train(
             step,
             float(config.get("gradient_clip", 1.0)),
         )
+        if adversarial:
+            set_requires_grad(discriminator, True)
+            discriminator_optimizer.zero_grad(set_to_none=True)
         generator_scheduler.step()
         ema.update(generator_module)
         step += 1

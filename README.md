@@ -31,6 +31,9 @@ pixi run smoke-flow
 pixi run smoke-flow-ar
 pixi run smoke-gan
 
+# Longer full-grid flow check plus an explicit coarse-conditioning ablation:
+qsub jobs/flow_1000_smoke.pbs
+
 qsub jobs/gpu_smoke.pbs
 qsub jobs/train_flow.pbs
 qsub jobs/train_flow_ar.pbs

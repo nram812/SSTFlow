@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -N sst-flow-raw
+#PBS -q h200q
+#PBS -l select=1:ncpus=8:mem=64GB:ngpus=1
+#PBS -l walltime=00:30:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+run_dir=${RUN_DIR:-runs/smoke/flow_sr}
+pixi run -e gpu python -u src/check_conditioning.py --run "$run_dir" --device cuda --steps 25 --weights model.pt

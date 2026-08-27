@@ -269,13 +269,16 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] **B3** `src/evaluate.py` — offline test-split evaluation for any run directory: RMSE/MAE/bias/spectra, sampler-step ablation, multi-day NetCDF.
 - [x] **B4** `src/validate_data.py` — standalone preflight: assert no NaN reaches a batch, masks agree, statistics are sane, splits are disjoint and gapless.
 - [x] **B5** `configs/flow_sr.json`, `configs/flow_ar.json`, `configs/gan_sr.json`.
-- [x] **B6** `tests/` — the full matrix in Part C (102 tests green on 2026-08-26).
+- [x] **B6** `tests/` — the full matrix in Part C (104 tests, including conditioning-ablation and GAN critic-freeze regressions).
 - [x] **B7** `jobs/*.pbs` — `preprocess.pbs` (shortq), `cpu_tests.pbs` (shortq), `gpu_smoke.pbs` (h200q), `train_flow.pbs` / `train_flow_ar.pbs` / `train_gan.pbs` (h200q, self-resubmitting on `status == "checkpointed"`).
 - [x] **B8** Real preprocessing complete: mean 19.833256 °C, std 8.699326 °C, 32 × 32 coarse grid, 716 valid coarse cells.
-- [x] **B9** Full CPU suite green: 102 passed in 9.50 s with CPU thread counts bounded to one for deterministic throughput.
+- [x] **B9** Full CPU suite green: 104 tests, including the two-worker DataLoader check on a PBS node.
 - [x] **B10** Real-grid CPU smoke training complete for all three models (3 steps each); every run produced PNG, NetCDF, checkpoint, weights, history, and passing status. AR rollout and GAN adversarial paths were exercised.
 - [x] **B11** GPU smoke passed on an NVIDIA H200 in job `6406137`: production-batch forward/backward for all models, 11.93 GiB maximum peak allocation, 25-step Heun in 1.91 s, 10-day AR rollout in 19.34 s, and a verified NetCDF product.
 - [x] **B12** `README.md`, `AGENTS.md`, `.gitignore`, Git repository, and initial commit `8c0bb9c` created.
+- [x] **B13** 1000-step full-grid GPU flow smoke passed in job `6406393`: 997 resumed steps in 80.8 s (~12.3 steps/s), preview + NetCDF written, and the raw model achieved 0.70 °C RMSE with 99.3 % skill versus same-noise coarse-SST ablation. The initially noisy preview was traced to expected fixed-decay EMA lag, not a broken conditioning path.
+- [ ] **B14** Complete the three 120,000-step production runs. Active jobs: flow `6406390`, autoregressive flow `6406391`, and corrected GAN `6406398`; each job checkpoints and self-resubmits at the 23-hour guard until complete.
+- [x] **B15** GAN adversarial recovery verified. The step-4000 audit found generator-loss gradients contaminating critic updates; job `6406392` was stopped, the critic is now frozen during generator updates, a regression test was added, and job `6406398` resumed. By step 6000 critic loss recovered from 10.28 to 0.45, with real/fake logits separating from +9.06/+9.06 to +3.50/−3.09 and finite validation output.
 
 ## PART C — Exhaustive test matrix
 
@@ -436,7 +439,7 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 5. Job fails loudly (non-zero exit) on any non-finite loss.
 
 ### C13 Acceptance criteria before launching production runs
-- [x] Whole `pixi run test` suite green on CPU (102 passed, 2026-08-26).
+- [x] Whole `pixi run test` suite green on CPU (104 tests, 2026-08-27).
 - [x] `pixi run validate-data` green on the real file (all nine checks passed).
 - [x] All three CPU smoke trainings produce PNG + NetCDF + checkpoint.
 - [x] `jobs/gpu_smoke.pbs` completes on h200q within its walltime and fits in memory (job `6406137`, peak 11.93 GiB).

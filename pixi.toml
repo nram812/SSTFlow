@@ -3,7 +3,7 @@ name = "sst-downscaling"
 version = "0.1.0"
 description = "Flow matching, autoregressive flow matching, and GAN super-resolution of OFAM sea-surface temperature"
 channels = ["conda-forge"]
-platforms = [{ platform = "linux-64", cuda = "12" }]
+platforms = ["linux-64"]
 
 # Shared, hardware independent dependencies.  PyTorch itself is pulled in by the
 # `cpu` / `gpu` features below because the login nodes on this cluster do not
@@ -23,6 +23,13 @@ pytest = ">=8,<9"
 
 [feature.cpu.dependencies]
 pytorch-cpu = ">=2.5,<3"
+
+[feature.gpu]
+# Keep CUDA scoped to the GPU environment so the CPU environment remains
+# runnable on login nodes without a visible driver. Pixi currently warns that
+# this legacy spelling is deprecated, but feature-specific platform objects do
+# not yet preserve this two-environment behavior on the installed Pixi version.
+system-requirements = { cuda = "12" }
 
 [feature.gpu.dependencies]
 pytorch-gpu = ">=2.5,<3"

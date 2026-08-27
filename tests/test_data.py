@@ -200,7 +200,11 @@ def test_dataloader_multiple_workers(config, normalization, derived):
     loader = DataLoader(
         dataset, batch_size=2, num_workers=2, multiprocessing_context="spawn"
     )
-    batch = next(iter(loader))
+    # Exhaust the iterator so PyTorch joins both workers cleanly; abandoning an
+    # iterator after one batch can emit a spurious worker-aborted warning at
+    # interpreter shutdown even though the batch itself succeeded.
+    batches = list(loader)
+    batch = batches[0]
     assert batch["target"].shape[0] == 2
     assert torch.isfinite(batch["target"]).all()
     assert torch.isfinite(batch["condition"]).all()

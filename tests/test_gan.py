@@ -2,6 +2,7 @@ import torch
 
 from losses import hinge_discriminator_loss, hinge_generator_loss, masked_mse
 from model_gan import Discriminator, Generator
+from train_gan import set_requires_grad
 
 
 def inputs():
@@ -41,3 +42,16 @@ def test_one_gan_step_runs_and_content_is_single_sample():
     fake = gen(condition, mask); content = masked_mse(fake, target, mask)
     loss = 10 * content + hinge_generator_loss(disc(fake, condition, mask)); loss.backward()
     assert torch.isfinite(loss) and content == masked_mse(fake, target, mask)
+
+
+def test_generator_step_does_not_accumulate_critic_gradients():
+    condition, mask, target = inputs(); gen, disc = generator(), discriminator()
+    set_requires_grad(disc, False)
+    fake = gen(condition, mask)
+    loss = masked_mse(fake, target, mask) + hinge_generator_loss(
+        disc(fake, condition, mask)
+    )
+    loss.backward()
+    assert any(parameter.grad is not None for parameter in gen.parameters())
+    assert all(parameter.grad is None for parameter in disc.parameters())
+    set_requires_grad(disc, True)
