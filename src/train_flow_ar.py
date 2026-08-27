@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""Autoregressive flow-matching super-resolution with single-step rollout.
+"""Coarse-authoritative autoregressive flow-matching super-resolution.
 
 Each sample is a consecutive day pair.  The model predicts the high-resolution
 field ``y(t+1)`` from the coarse predictor ``x(t+1)`` **and** the previous
 high-resolution state ``y(t)``.
 
-Two objectives are combined:
-
-``velocity``  the ordinary masked flow-matching loss with teacher forcing;
-``rollout``   a differentiable *single-step* rollout - the sampler is unrolled
-              for a few steps, the generated day is compared with the truth in
-              state space, and the gradient flows through the whole ODE solve.
-
-The rollout term is switched on after ``rollout_start_step`` and weighted by
-``rollout_weight`` so early training is cheap and stable.
+Training uses only the ordinary masked flow-matching velocity loss.  The former
+differentiable rollout penalty was retired after it encouraged persistence.
+Free-running sequences remain as evaluation diagnostics, with every generated
+day projected onto that day's authoritative coarse ocean-block means.
 """
 
 from __future__ import annotations
@@ -37,26 +32,16 @@ from callbacks import (
     to_physical,
 )
 from common import load_config
+from consistency import coarse_consistency_mse
 from flow import (
     flow_matching_loss,
     rollout,
     sample,
-    single_step_rollout_loss,
 )
 from losses import masked_mse
 from model import build_model, parameter_count
 
 DATASET_KIND = "autoregressive"
-
-
-def rollout_active(config: dict, step: int, is_smoke: bool) -> bool:
-    if float(config.get("rollout_weight", 0.0)) <= 0.0:
-        return False
-    if is_smoke:
-        return True
-    start = int(config.get("rollout_start_step", 20000))
-    every = max(int(config.get("rollout_every", 4)), 1)
-    return step >= start and step % every == 0
 
 
 @torch.no_grad()
@@ -88,8 +73,14 @@ def validation_metrics(
         previous_state=batch["previous"],
         generator=generator,
         device=device,
+        enforce_coarse_consistency=bool(
+            config.get("enforce_coarse_consistency", True)
+        ),
     )
     sampled_mse = float(masked_mse(generated, batch["target"], batch["mask"]))
+    coarse_mse = float(
+        coarse_consistency_mse(generated, batch["condition"], batch["mask"])
+    )
     persistence_mse = float(
         masked_mse(batch["previous"], batch["target"], batch["mask"])
     )
@@ -101,6 +92,7 @@ def validation_metrics(
     return {
         "velocity_mse": velocity_loss,
         "sampled_mse_normalized": sampled_mse,
+        "coarse_consistency_mse_normalized": coarse_mse,
         "persistence_mse_normalized": persistence_mse,
         "skill_vs_persistence": float(
             1.0 - sampled_mse / max(persistence_mse, 1.0e-12)
@@ -137,6 +129,9 @@ def run_callbacks(
         previous_state=batch["previous"],
         generator=generator,
         device=device,
+        enforce_coarse_consistency=bool(
+            config.get("enforce_coarse_consistency", True)
+        ),
     )
     generated_physical = to_physical(generated, normalization, derived.ocean_mask)[:, 0]
     target_physical = to_physical(batch["target"], normalization, derived.ocean_mask)[
@@ -216,12 +211,18 @@ def free_running_rollout(
             steps=int(config.get("rollout_sampler_steps", 25)),
             sampler=str(config.get("sampler", "heun")),
             generator=generator,
+            enforce_coarse_consistency=bool(
+                config.get("enforce_coarse_consistency", True)
+            ),
         )[0]
         targets = batch["targets"][0]
         generated_physical = to_physical(
             predictions, normalization, derived.ocean_mask
         )[:, 0]
         target_physical = to_physical(targets, normalization, derived.ocean_mask)[:, 0]
+        coarse_physical = coarse_to_physical(
+            batch["conditions"][0], normalization, derived.ocean_mask_lr
+        )
         dates = dataset.date_window(0)[1:]
         path = save_rollout_netcdf(
             generated_physical,
@@ -239,6 +240,9 @@ def free_running_rollout(
                 "sampler_steps": int(config.get("rollout_sampler_steps", 25)),
                 "mode": "free_running",
             },
+            coarse=coarse_physical,
+            lat_lr=derived.lat_lr,
+            lon_lr=derived.lon_lr,
         )
         save_rollout_skill_plot(
             generated_physical,
@@ -248,6 +252,10 @@ def free_running_rollout(
         )
         print(f"[callback] wrote {path}", flush=True)
         error = generated_physical - target_physical
+        generated_change = np.abs(np.diff(generated_physical, axis=0))
+        target_change = np.abs(np.diff(target_physical, axis=0))
+        generated_evolution = float(np.nanmean(generated_change))
+        target_evolution = float(np.nanmean(target_change))
         metrics = {
             "days": int(days),
             "rmse_by_lead": [
@@ -257,6 +265,9 @@ def free_running_rollout(
             "bias_by_lead": [
                 float(value) for value in np.nanmean(error, axis=(1, 2))
             ],
+            "generated_mean_abs_daily_change": generated_evolution,
+            "target_mean_abs_daily_change": target_evolution,
+            "evolution_ratio": generated_evolution / max(target_evolution, 1.0e-12),
         }
         model.train()
         return metrics
@@ -270,6 +281,7 @@ def train(
     device_name: str | None = None,
 ) -> dict:
     is_smoke = smoke_steps is not None
+    smoke_rollout_metrics = None
     if is_smoke:
         config = engine.smoke_config(config)
     seed, device, output_dir, normalization, derived = engine.prepare(
@@ -305,14 +317,6 @@ def train(
         num_workers=0 if is_smoke else int(config.get("num_workers", 0)),
     )
     batches = engine.infinite_batches(loader)
-    rollout_loader = engine.make_loader(
-        train_dataset,
-        int(config.get("rollout_batch_size", 2)),
-        seed + 1,
-        num_workers=0,
-    )
-    rollout_batches = engine.infinite_batches(rollout_loader)
-
     started = time.monotonic()
     deadline = engine.deadline_from(config, is_smoke, started)
     model.train()
@@ -336,22 +340,6 @@ def train(
         engine.check_finite(velocity_loss, step, "velocity loss")
         loss = velocity_loss
         record = {"step": step + 1, "velocity": float(velocity_loss.detach())}
-
-        if rollout_active(config, step, is_smoke):
-            rollout_batch = engine.batch_to_device(next(rollout_batches), device)
-            rollout_mse, _ = single_step_rollout_loss(
-                model,
-                rollout_batch["previous"],
-                rollout_batch["condition"],
-                rollout_batch["target"],
-                rollout_batch["mask"],
-                steps=int(config.get("rollout_train_steps", 4)),
-            )
-            engine.check_finite(rollout_mse, step, "rollout loss")
-            weight = float(config.get("rollout_weight", 0.0))
-            loss = loss + weight * rollout_mse
-            record["rollout"] = float(rollout_mse.detach())
-            record["rollout_weight"] = weight
 
         engine.check_finite(loss, step, "total loss")
         loss.backward()
@@ -405,7 +393,7 @@ def train(
             save_loss_curve(
                 history,
                 output_dir / "predictions" / f"loss_curve_step_{step:06d}.png",
-                keys=("total", "velocity", "rollout"),
+                keys=("total", "velocity"),
             )
 
         if engine.should_run(step, int(config.get("rollout_netcdf_every", 10000))):
@@ -461,7 +449,7 @@ def train(
             seed,
             write_netcdf=True,
         )
-        free_running_rollout(
+        smoke_rollout_metrics = free_running_rollout(
             ema.module,
             {**config, "rollout_days": 2, "rollout_sampler_steps": 2},
             normalization,
@@ -481,11 +469,12 @@ def train(
             "smoke_test": is_smoke,
             "parameters": parameter_count(model),
             "training_pairs": len(train_dataset),
-            "rollout_exercised": any("rollout" in record for record in history),
+            "rollout_training_loss": False,
+            "rollout_diagnostic": smoke_rollout_metrics,
             "final_loss": float(np.mean([r["total"] for r in history[-50:]]))
             if history
             else None,
-            "loss_keys": ("total", "velocity", "rollout"),
+            "loss_keys": ("total", "velocity"),
         },
         started,
     )

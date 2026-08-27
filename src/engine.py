@@ -194,6 +194,8 @@ def clip_and_step(
 
 def build_scheduler(optimizer, config: dict):
     """Linear warmup followed by cosine decay to ``min_learning_rate_factor``."""
+    if config.get("scheduler_kind", "cosine") == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
     warmup = int(config.get("warmup_steps", 500))
     total = int(config.get("max_steps", 100000))
     floor = float(config.get("min_learning_rate_factor", 0.05))
@@ -245,6 +247,18 @@ def save_training_state(
     save_checkpoint(output_dir / "checkpoint.pt", payload)
     for name, module in modules.items():
         atomic_torch_save(module.state_dict(), output_dir / f"{name}.pt")
+    snapshot_every = int(config.get("checkpoint_every", 0))
+    snapshot_min_step = int(config.get("snapshot_min_step", 0))
+    if (
+        config.get("keep_step_weights", False)
+        and step >= snapshot_min_step
+        and should_run(step, snapshot_every)
+    ):
+        for name, module in modules.items():
+            atomic_torch_save(
+                module.state_dict(),
+                output_dir / "weights" / f"{name}_step_{step:06d}.pt",
+            )
     atomic_json(
         output_dir / "training_history.json",
         {"step": int(step), "history": history, "validation": validation},
@@ -258,9 +272,19 @@ def restore_training_state(
     optimizers: dict,
     schedulers: dict,
     device: torch.device,
+    resume_from: str | Path | None = None,
+    continuation_learning_rate: float | None = None,
 ):
-    """Resume from ``checkpoint.pt`` when one exists; returns the new state."""
-    path = output_dir / "checkpoint.pt"
+    """Resume locally, or fork a run from an external checkpoint.
+
+    A local checkpoint always wins and restores the scheduler normally.  An
+    external fork restores weights, optimiser moments and RNG, but deliberately
+    starts the newly configured scheduler at ``continuation_learning_rate``.
+    This avoids a cosine-schedule jump when extending a completed run.
+    """
+    local_path = output_dir / "checkpoint.pt"
+    external = not local_path.is_file() and resume_from is not None
+    path = Path(resume_from) if external else local_path
     if not path.is_file():
         return 0, [], {}
     state = torch.load(path, map_location=device, weights_only=False)
@@ -268,13 +292,18 @@ def restore_training_state(
         module.load_state_dict(state[f"module_{name}"])
     for name, optimizer in optimizers.items():
         optimizer.load_state_dict(state[f"optimizer_{name}"])
+        if external and continuation_learning_rate is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = float(continuation_learning_rate)
+                group["initial_lr"] = float(continuation_learning_rate)
     for name, scheduler in schedulers.items():
         key = f"scheduler_{name}"
-        if scheduler is not None and key in state:
+        if not external and scheduler is not None and key in state:
             scheduler.load_state_dict(state[key])
     restore_rng_state(state)
     step = int(state["step"])
-    print(f"[resume] step {step} from {path}", flush=True)
+    mode = "fork" if external else "resume"
+    print(f"[{mode}] step {step} from {path}", flush=True)
     return step, list(state.get("history", [])), dict(state.get("validation", {}))
 
 

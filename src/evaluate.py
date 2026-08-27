@@ -44,7 +44,15 @@ def load_run(run_dir: Path, device: torch.device):
 
 
 @torch.no_grad()
-def predict(model, batch: dict, config: dict, device: torch.device, steps: int, seed: int):
+def predict(
+    model,
+    batch: dict,
+    config: dict,
+    device: torch.device,
+    steps: int,
+    seed: int,
+    sampler: str | None = None,
+):
     batch = engine.batch_to_device(batch, device)
     generator = torch.Generator(device=device).manual_seed(seed)
     kind = config.get("model_kind")
@@ -52,18 +60,29 @@ def predict(model, batch: dict, config: dict, device: torch.device, steps: int, 
         generated = model(batch["condition"], batch["mask"], generator=generator)
     else:
         generated = sample(model, batch["condition"], batch["mask"], batch["target"].shape,
-                           steps=steps, sampler=config.get("sampler", "heun"),
+                           steps=steps, sampler=sampler or config.get("sampler", "heun"),
                            previous_state=batch.get("previous"), generator=generator,
-                           device=device)
+                           device=device,
+                           enforce_coarse_consistency=bool(
+                               config.get("enforce_coarse_consistency", False)
+                           ))
     return generated, batch
 
 
-def evaluate(run_dir: Path, device_name: str | None = None, samples: int = 32,
+def evaluation_indices(dataset, samples: int | None) -> np.ndarray:
+    """Select every item exactly once, or a deterministic preview subset."""
+    if samples is None:
+        return np.arange(len(dataset), dtype=np.int64)
+    return engine.fixed_indices(dataset, samples)
+
+
+def evaluate(run_dir: Path, device_name: str | None = None, samples: int | None = 32,
              batch_size: int = 4, sampler_steps: list[int] | None = None,
-             rollout_days: int = 10) -> dict:
+             rollout_days: int = 10, sampler: str | None = None) -> dict:
     device = engine.resolve_device(device_name)
     config, normalization, derived, dataset, model, weights = load_run(run_dir, device)
-    indices = engine.fixed_indices(dataset, samples)
+    indices = evaluation_indices(dataset, samples)
+    full_test = samples is None
     step_values = sampler_steps or ([int(config.get("preview_sampler_steps", 25))]
                                     if config.get("model_kind") != "gan" else [1])
     results: dict[str, dict] = {}
@@ -72,8 +91,17 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int = 32,
         generated_all, target_all, coarse_all, dates = [], [], [], []
         for start in range(0, len(indices), batch_size):
             chosen = indices[start:start + batch_size]
+            if start == 0 or start % (10 * batch_size) == 0:
+                print(
+                    f"[evaluate] sampler_steps={steps} "
+                    f"samples={start}/{len(indices)}",
+                    flush=True,
+                )
             raw = engine.collate_indices(dataset, chosen)
-            generated, batch = predict(model, raw, config, device, steps, int(config.get("seed", 42)) + start)
+            generated, batch = predict(
+                model, raw, config, device, steps,
+                int(config.get("seed", 42)) + start, sampler=sampler,
+            )
             generated_all.append(engine_to_physical(generated, normalization, derived.ocean_mask))
             target_all.append(engine_to_physical(batch["target"], normalization, derived.ocean_mask))
             coarse_all.append(coarse_to_physical(batch["condition"], normalization, derived.ocean_mask_lr))
@@ -94,9 +122,17 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int = 32,
     output_dir = run_dir / "evaluation"
     output_dir.mkdir(parents=True, exist_ok=True)
     generated_np, target_np, coarse_np, dates = saved
+    selected_sampler = sampler or config.get("sampler", "heun")
+    suffix = f"_{selected_sampler}_{int(step_values[-1])}step" if sampler else ""
+    product_name = (
+        f"full_test_samples{suffix}.nc" if full_test else f"test_samples{suffix}.nc"
+    )
     save_netcdf(generated_np, target_np, coarse_np, dates, derived.lat, derived.lon,
-                derived.lat_lr, derived.lon_lr, output_dir / "test_samples.nc",
-                {"experiment": config["name"], "weights": weights.name})
+                derived.lat_lr, derived.lon_lr, output_dir / product_name,
+                {"experiment": config["name"], "weights": weights.name,
+                 "selection": "full_test" if full_test else "fixed_subset",
+                 "sampler": selected_sampler,
+                 "sampler_steps": int(step_values[-1])})
 
     rollout_metrics = None
     if config.get("model_kind") == "autoregressive" and rollout_days > 0:
@@ -108,18 +144,29 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int = 32,
         generator = torch.Generator(device=device).manual_seed(int(config.get("seed", 42)))
         generated = rollout(model, previous, conditions, mask,
                             int(config.get("rollout_sampler_steps", 25)),
-                            config.get("sampler", "heun"), generator)[0]
+                            config.get("sampler", "heun"), generator,
+                            enforce_coarse_consistency=bool(
+                                config.get("enforce_coarse_consistency", False)
+                            ))[0]
         truth = torch.stack([item["target"] for item in items])
         generated_physical = engine_to_physical(generated, normalization, derived.ocean_mask)[:, 0]
         target_physical = engine_to_physical(truth, normalization, derived.ocean_mask)[:, 0]
         rollout_metrics = field_metrics(generated_physical, target_physical)
         save_rollout_netcdf(generated_physical, target_physical,
                             [item["date"] for item in items], derived.lat, derived.lon,
-                            output_dir / "test_rollout.nc", {"experiment": config["name"]})
+                            output_dir / "test_rollout.nc", {"experiment": config["name"]},
+                            coarse=coarse_to_physical(conditions[0], normalization,
+                                                      derived.ocean_mask_lr),
+                            lat_lr=derived.lat_lr, lon_lr=derived.lon_lr)
 
     summary = {"run": str(run_dir), "weights": weights.name, "samples": len(indices),
+               "selection": "full_test" if full_test else "fixed_subset",
+               "sampler": selected_sampler,
                "sampler_step_ablation": results, "rollout": rollout_metrics}
-    write_metrics(output_dir / "metrics.json", summary)
+    metrics_name = (
+        f"full_test_metrics{suffix}.json" if full_test else f"metrics{suffix}.json"
+    )
+    write_metrics(output_dir / metrics_name, summary)
     print(json.dumps(summary, indent=2), flush=True)
     dataset.close()
     return summary
@@ -135,12 +182,19 @@ def main() -> None:
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--device")
     parser.add_argument("--samples", type=int, default=32)
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="infer every test item exactly once (overrides --samples)",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--sampler-steps", type=int, nargs="+")
+    parser.add_argument("--sampler", choices=("euler", "heun", "ab2", "ab3_pc"))
     parser.add_argument("--rollout-days", type=int, default=10)
     arguments = parser.parse_args()
-    evaluate(arguments.run, arguments.device, arguments.samples, arguments.batch_size,
-             arguments.sampler_steps, arguments.rollout_days)
+    samples = None if arguments.all_samples else arguments.samples
+    evaluate(arguments.run, arguments.device, samples, arguments.batch_size,
+             arguments.sampler_steps, arguments.rollout_days, arguments.sampler)
 
 
 if __name__ == "__main__":

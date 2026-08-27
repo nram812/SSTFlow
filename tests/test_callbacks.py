@@ -47,9 +47,11 @@ def test_save_netcdf_roundtrip_and_atomic(tmp_path):
 def test_save_rollout_netcdf_roundtrip(tmp_path):
     _, target, generated = fields(); path = tmp_path / "rollout.nc"
     save_rollout_netcdf(np.stack([generated] * 2), np.stack([target] * 2),
-                        ["2000-01-01", "2000-01-02"], np.arange(8), np.arange(8), path, {})
+                        ["2000-01-01", "2000-01-02"], np.arange(8), np.arange(8), path, {},
+                        coarse=np.ones((2, 2, 2)), lat_lr=np.arange(2), lon_lr=np.arange(2))
     with xr.open_dataset(path) as dataset:
         assert dataset.sizes["lead"] == 2 and str(dataset.time.values[1])[:10] == "2000-01-02"
+        assert dataset.sst_coarse.shape == (2, 2, 2)
 
 
 def test_radial_spectrum_smooth_has_less_high_power():

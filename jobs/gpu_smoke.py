@@ -13,6 +13,7 @@ import torch
 import engine
 from callbacks import coarse_to_physical, save_netcdf, to_physical
 from common import atomic_json, attach_ocean_mask, load_config
+from consistency import coarse_consistency_mse
 from data import DerivedProduct, build_dataset
 from flow import flow_matching_loss, rollout, sample
 from losses import hinge_discriminator_loss, hinge_generator_loss, masked_mse
@@ -73,9 +74,26 @@ def main() -> None:
     conditions = torch.stack([item["condition"] for item in items])[None].to(device)
     previous = items[0]["previous"][None].to(device); mask = items[0]["mask"][None].to(device); model = build_model(config).to(device).eval()
     torch.cuda.reset_peak_memory_stats(); started = time.perf_counter()
-    generated = rollout(model, previous, conditions, mask, int(config["rollout_sampler_steps"]), config["sampler"])
-    torch.cuda.synchronize(); report["ar_rollout_10"] = {"seconds": time.perf_counter() - started, "peak_memory_mb": peak_mb(), "days": days}
+    generated = rollout(
+        model,
+        previous,
+        conditions,
+        mask,
+        int(config["rollout_sampler_steps"]),
+        config["sampler"],
+        enforce_coarse_consistency=bool(
+            config.get("enforce_coarse_consistency", False)
+        ),
+    )
+    torch.cuda.synchronize()
+    consistency_mse = float(coarse_consistency_mse(
+        generated.flatten(0, 1),
+        conditions.flatten(0, 1),
+        mask.expand(days, -1, -1, -1),
+    ))
+    report["ar_rollout_10"] = {"seconds": time.perf_counter() - started, "peak_memory_mb": peak_mb(), "days": days, "coarse_consistency_mse_normalized": consistency_mse}
     if not torch.isfinite(generated).all(): raise FloatingPointError("non-finite AR rollout")
+    if consistency_mse > 1.0e-10: raise AssertionError(f"coarse consistency MSE {consistency_mse} is too large")
     atomic_json(output / "report.json", report); print(json.dumps(report, indent=2), flush=True)
 
 

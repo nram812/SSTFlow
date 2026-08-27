@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from consistency import within_block_anomaly
+
 
 def group_count(channels: int) -> int:
     for groups in (32, 16, 8, 4, 2, 1):
@@ -204,10 +206,15 @@ class LagEncoder(nn.Module):
 
 
 class GatedFiLM(nn.Module):
-    """Bounded feature-wise modulation; the gate starts near zero."""
+    """Bounded feature-wise modulation with a hard guidance-strength cap."""
 
-    def __init__(self, lag_channels: int, main_channels: int):
+    def __init__(
+        self, lag_channels: int, main_channels: int, guidance_scale: float = 0.25
+    ):
         super().__init__()
+        if not 0.0 <= guidance_scale <= 1.0:
+            raise ValueError("lag_guidance_scale must lie in [0, 1]")
+        self.guidance_scale = float(guidance_scale)
         self.parameters_from_lag = nn.Conv2d(lag_channels, main_channels * 2, 1)
         self.gate_logit = nn.Parameter(torch.full((1, main_channels, 1, 1), -2.0))
         nn.init.zeros_(self.parameters_from_lag.weight)
@@ -219,7 +226,7 @@ class GatedFiLM(nn.Module):
                 lag, size=main.shape[-2:], mode="bilinear", align_corners=False
             )
         scale, shift = self.parameters_from_lag(lag).chunk(2, dim=1)
-        gate = torch.sigmoid(self.gate_logit)
+        gate = self.guidance_scale * torch.sigmoid(self.gate_logit)
         return main * (1.0 + gate * torch.tanh(scale)) + gate * torch.tanh(shift)
 
 
@@ -374,6 +381,7 @@ class AutoregressiveSuperResolutionFlowUNet(SuperResolutionFlowUNet):
         lag_base_channels: int = 16,
         lag_dropout: float = 0.10,
         lag_path_dropout: float = 0.10,
+        lag_guidance_scale: float = 0.25,
     ):
         super().__init__(
             base_channels=base_channels,
@@ -392,7 +400,11 @@ class AutoregressiveSuperResolutionFlowUNet(SuperResolutionFlowUNet):
         )
         self.fusion = nn.ModuleList(
             [
-                GatedFiLM(self.lag_encoder.channels[level], self.channels[level])
+                GatedFiLM(
+                    self.lag_encoder.channels[level],
+                    self.channels[level],
+                    lag_guidance_scale,
+                )
                 for level in range(levels)
             ]
         )
@@ -412,8 +424,14 @@ class AutoregressiveSuperResolutionFlowUNet(SuperResolutionFlowUNet):
                 f"state {tuple(state.shape)}"
             )
         embedding = self.time(flow_time)
+        # The current coarse field is authoritative.  Remove the previous
+        # day's block means so the lag path can guide fronts and texture but
+        # cannot carry yesterday's large-scale SST forward by itself.
+        lag_anomaly = within_block_anomaly(
+            previous_state, ocean_mask, condition.shape[-2:]
+        )
         lag_features = self.lag_encoder(
-            torch.cat((previous_state, ocean_mask.expand_as(previous_state)), dim=1)
+            torch.cat((lag_anomaly, ocean_mask.expand_as(previous_state)), dim=1)
         )
         hidden, skips = self.encode(
             state,
@@ -451,6 +469,7 @@ def build_model(config: dict) -> SuperResolutionFlowUNet:
             lag_base_channels=int(config.get("lag_base_channels", 16)),
             lag_dropout=float(config.get("lag_dropout", 0.10)),
             lag_path_dropout=float(config.get("lag_path_dropout", 0.10)),
+            lag_guidance_scale=float(config.get("lag_guidance_scale", 0.25)),
         )
     raise ValueError(f"Unknown model_kind {kind!r}")
 

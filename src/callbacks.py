@@ -221,19 +221,31 @@ def save_rollout_netcdf(
     lon: np.ndarray,
     output_path: Path,
     attrs: dict,
+    coarse: np.ndarray | None = None,
+    lat_lr: np.ndarray | None = None,
+    lon_lr: np.ndarray | None = None,
 ) -> Path:
     """Write a free-running autoregressive rollout with a lead-time axis."""
+    data_vars = {
+        "sst_generated": (("lead", "lat", "lon"), generated.astype(np.float32)),
+        "sst_target": (("lead", "lat", "lon"), target.astype(np.float32)),
+    }
+    coords = {
+        "lead": np.arange(1, generated.shape[0] + 1, dtype=np.int32),
+        "time": ("lead", np.asarray(dates, dtype="datetime64[ns]")),
+        "lat": lat,
+        "lon": lon,
+    }
+    if coarse is not None:
+        if lat_lr is None or lon_lr is None:
+            raise ValueError("lat_lr and lon_lr are required with rollout coarse data")
+        data_vars["sst_coarse"] = (
+            ("lead", "lat_lr", "lon_lr"), coarse.astype(np.float32)
+        )
+        coords.update(lat_lr=lat_lr, lon_lr=lon_lr)
     dataset = xr.Dataset(
-        data_vars={
-            "sst_generated": (("lead", "lat", "lon"), generated.astype(np.float32)),
-            "sst_target": (("lead", "lat", "lon"), target.astype(np.float32)),
-        },
-        coords={
-            "lead": np.arange(1, generated.shape[0] + 1, dtype=np.int32),
-            "time": ("lead", np.asarray(dates, dtype="datetime64[ns]")),
-            "lat": lat,
-            "lon": lon,
-        },
+        data_vars=data_vars,
+        coords=coords,
         attrs={"units": "degrees C", **attrs},
     )
     return _write(dataset, output_path)

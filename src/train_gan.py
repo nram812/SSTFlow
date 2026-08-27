@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Conditional GAN baseline for SST super-resolution (PyTorch).
+"""Compact multi-scale GAN for fine-detail SST super-resolution (PyTorch).
 
 Training alternates a masked hinge critic step with a generator step whose
 objective is
 
-``loss_G = lambda_content * masked_mse(generated, truth) + lambda_adv * hinge(G)``
+``loss_G = pixel MSE + gradient + spectrum + feature matching + adversarial``
 
 The content term is a **single-sample** masked MSE, deliberately replacing the
 ensemble-mean MSE that is common in GAN downscaling papers.  Every reduction is
@@ -31,7 +31,14 @@ from callbacks import (
     to_physical,
 )
 from common import load_config
-from losses import hinge_discriminator_loss, hinge_generator_loss, masked_mse
+from losses import (
+    feature_matching_loss,
+    hinge_discriminator_loss,
+    hinge_generator_loss,
+    masked_gradient_loss,
+    masked_mse,
+    spectral_amplitude_loss,
+)
 from model import parameter_count
 from model_gan import build_discriminator, build_generator
 
@@ -151,13 +158,13 @@ def train(
         generator_module.parameters(),
         lr=float(config["learning_rate"]),
         weight_decay=float(config.get("weight_decay", 1.0e-5)),
-        betas=(0.5, 0.9),
+        betas=tuple(config.get("generator_betas", (0.0, 0.99))),
     )
     discriminator_optimizer = torch.optim.AdamW(
         discriminator.parameters(),
         lr=float(config.get("discriminator_learning_rate", config["learning_rate"])),
         weight_decay=float(config.get("weight_decay", 1.0e-5)),
-        betas=(0.5, 0.9),
+        betas=tuple(config.get("discriminator_betas", (0.0, 0.99))),
     )
     generator_scheduler = engine.build_scheduler(generator_optimizer, config)
 
@@ -188,6 +195,9 @@ def train(
 
     lambda_content = float(config.get("lambda_content", 10.0))
     lambda_adversarial = float(config.get("lambda_adversarial", 1.0))
+    lambda_gradient = float(config.get("lambda_gradient", 0.0))
+    lambda_spectral = float(config.get("lambda_spectral", 0.0))
+    lambda_feature = float(config.get("lambda_feature_matching", 0.0))
     critic_steps = max(int(config.get("critic_steps", 1)), 1)
     adversarial_start = (
         0 if is_smoke else int(config.get("adversarial_start_step", 2000))
@@ -239,18 +249,38 @@ def train(
         engine.check_finite(content_loss, step, "content loss")
         loss = lambda_content * content_loss
         record["content"] = float(content_loss.detach())
+        if lambda_gradient:
+            gradient_loss = masked_gradient_loss(generated, batch["target"], batch["mask"])
+            loss = loss + lambda_gradient * gradient_loss
+            record["gradient"] = float(gradient_loss.detach())
+        if lambda_spectral:
+            spectral_loss = spectral_amplitude_loss(generated, batch["target"], batch["mask"])
+            loss = loss + lambda_spectral * spectral_loss
+            record["spectral"] = float(spectral_loss.detach())
         if adversarial:
             # The critic supplies d(score)/d(generated), but its own parameters
             # must not receive generator-loss gradients. Leaving those grads
             # in place contaminates the next critic update with the opposite
             # objective and drives both real/fake logits upward.
             set_requires_grad(discriminator, False)
-            adversarial_loss = hinge_generator_loss(
-                discriminator(generated, batch["condition"], batch["mask"])
+            fake_logits, fake_features, feature_masks = discriminator(
+                generated, batch["condition"], batch["mask"], return_features=True
             )
+            with torch.no_grad():
+                _, real_features, _ = discriminator(
+                    batch["target"], batch["condition"], batch["mask"],
+                    return_features=True,
+                )
+            adversarial_loss = hinge_generator_loss(fake_logits)
             engine.check_finite(adversarial_loss, step, "adversarial loss")
             loss = loss + lambda_adversarial * adversarial_loss
             record["adversarial_loss"] = float(adversarial_loss.detach())
+            if lambda_feature:
+                matching_loss = feature_matching_loss(
+                    fake_features, real_features, feature_masks
+                )
+                loss = loss + lambda_feature * matching_loss
+                record["feature_matching"] = float(matching_loss.detach())
         engine.check_finite(loss, step, "generator loss")
         loss.backward()
         gradient_norm = engine.clip_and_step(
@@ -309,7 +339,7 @@ def train(
             save_loss_curve(
                 history,
                 output_dir / "predictions" / f"loss_curve_step_{step:06d}.png",
-                keys=("total", "content", "critic"),
+                keys=("total", "content", "gradient", "spectral", "critic"),
             )
 
         if engine.should_run(step, int(config.get("checkpoint_every", 2000))):

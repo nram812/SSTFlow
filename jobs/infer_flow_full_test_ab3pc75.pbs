@@ -1,0 +1,11 @@
+#!/bin/bash
+#PBS -N flow-test-ab3
+#PBS -q h200q
+#PBS -l select=1:ncpus=8:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+pixi run -e gpu python src/evaluate.py \
+  --run runs/flow_sr --device cuda --all-samples --batch-size 4 \
+  --sampler ab3_pc --sampler-steps 75 --rollout-days 0

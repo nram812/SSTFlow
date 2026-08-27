@@ -13,6 +13,7 @@ from losses import (
     hinge_generator_loss,
     masked_bias,
     masked_l1,
+    masked_gradient_loss,
     masked_mean,
     masked_mse,
     masked_rmse,
@@ -94,6 +95,15 @@ def test_spectral_loss_zero_for_identical(fields):
 def test_spectral_loss_positive_for_different(fields):
     prediction, target, mask = fields
     assert float(spectral_amplitude_loss(prediction, target, mask)) > 0.0
+
+
+def test_gradient_loss_ignores_land_and_detects_ocean_detail(fields):
+    _, target, mask = fields
+    prediction = target.clone()
+    prediction[mask == 0] = 1.0e6
+    assert masked_gradient_loss(prediction, target, mask) == pytest.approx(0.001, rel=1e-5)
+    prediction[:, :, 2, 2] += 1.0
+    assert float(masked_gradient_loss(prediction, target, mask)) > 0.001
 
 
 def test_conservation_loss_zero_for_consistent_pair():

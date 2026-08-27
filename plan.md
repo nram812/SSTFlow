@@ -12,7 +12,7 @@ We build three models that map a **coarse (low-resolution) sea-surface temperatu
 | # | Experiment | Entry point | Config | Description |
 |---|---|---|---|---|
 | 1 | **Flow matching super-resolution** | `src/train_flow.py` | `configs/flow_sr.json` | Rectified flow, coarse → fine, no temporal memory. Analogous to the NZ CPM flow model but low→high resolution. |
-| 2 | **Autoregressive flow matching** | `src/train_flow_ar.py` | `configs/flow_ar.json` | Same, plus the previous day's high-resolution state as conditioning; trained with teacher forcing **and a differentiable single-step rollout**. |
+| 2 | **Autoregressive flow matching** | `src/train_flow_ar.py` | `configs/flow_ar.json` | Current-day coarse SST is authoritative; the previous high-resolution state contributes only bounded within-block fine-scale guidance. |
 | 3 | **Conditional GAN** | `src/train_gan.py` | `configs/gan_sr.json` | PyTorch conditional GAN with a masked hinge PatchGAN critic and a **single-sample masked MSE** content loss (explicitly *not* an ensemble-mean MSE). |
 
 Everything is masked: **the loss is computed over ocean pixels only.** Land is NaN in the source data, is replaced by zeros after normalisation, and is excluded from every reduction.
@@ -22,13 +22,13 @@ Everything is masked: **the loss is computed over ocean pixels only.** Land is N
 | Requirement (from the brief) | Where it is implemented |
 |---|---|
 | "normal flow matching low to high resolution like the CPM flow matching" | `src/train_flow.py`, `src/flow.py`, `src/model.py::SuperResolutionFlowUNet` |
-| "autoregressive flow matching … do single step rollout" | `src/train_flow_ar.py`, `src/flow.py::single_step_rollout_loss`, `src/model.py::AutoregressiveSuperResolutionFlowUNet` |
+| "autoregressive flow matching" | `src/train_flow_ar.py`, `src/model.py::AutoregressiveSuperResolutionFlowUNet`, `src/consistency.py` |
 | "one GAN implementation … adapt code to pytorch … single mse loss as opposed to an ensemble MSE loss" | `src/model_gan.py`, `src/train_gan.py` (content term is `masked_mse(one_sample, truth)`) |
 | "netcdf outputs every so often and do illustrations after a certain number of epochs and save weights in a similar manner" | `src/callbacks.py`, `src/engine.py`; controlled by `netcdf_every`, `preview_every`, `checkpoint_every` |
 | "standard mean variance normalization (mean based on entire grid in the first pass), set all the nans to zeros … same nan mask each time step … loss only over [ocean] pixels" | `src/preprocess.py::training_statistics`, `src/data.py::_normalize_target`, `src/losses.py` |
 | "coarsen … block averaging, where over 50% of the domain is nan" | `src/coarsen.py::coarse_ocean_mask` (`min_valid_fraction = 0.5`) |
 | "create a new environment that is easily reproducible with pixi" | `pixi.toml` + `pixi.lock`, two environments (`default` = CPU, `gpu` = CUDA 12) |
-| "no constraint from low-to-high resolution in this first instance" | `lambda_conservation = 0.0` in every config; `losses.conservation_loss` exists but is inert |
+| "average of high resolution should be low resolution" | `consistency.project_to_coarse` exactly restores valid ocean-block means after AR sampling without altering the velocity loss |
 
 > **Terminology note.** The brief says "only compute the loss in flow matching over land pixels". Land in this dataset is *permanently missing* (NaN), so the only interpretable reading — and the one consistent with the earlier sentence "have a loss function that masks out the land values" — is **compute the loss over ocean pixels and mask out land**. That is what is implemented.
 
@@ -133,13 +133,15 @@ Both the coarse predictor and the fine target use the **same** scalars, so the n
 
 Adapted from: `NZ_domain_CPM/ml_downscaling/src/models.py` (residual block, time embedding, FiLM context) and `Autoregressive_Model/src/model.py` (channel attention, self attention, group count helper).
 
-### 4.2 Autoregressive variant — `AutoregressiveSuperResolutionFlowUNet`
+### 4.2 Autoregressive variant — coarse-authoritative revision
 
-Copies the **`LagEncoder` + `GatedFiLM`** idea verbatim in spirit from `Autoregressive_Model/src/model.py`, which exists precisely to stop a persistent field from short-circuiting the model:
+The first production attempt was stopped at about 86,000 steps because its free-running sequence was too persistent and validation remained worse than copying yesterday. The replacement preserves the `LagEncoder` + `GatedFiLM` structure but makes the hierarchy explicit:
 
-* A separate small encoder compresses `(previous_state, ocean_mask)` into four multiscale features.
-* `Dropout2d(lag_dropout = 0.10)` inside the encoder and **path dropout** (`lag_path_dropout = 0.10`) which zeroes the entire lag input for a random 10 % of samples, forcing the model to remain usable from the coarse predictor alone.
-* Fusion is a **bounded gated FiLM**: `main * (1 + g·tanh(scale)) + g·tanh(shift)` with `g = sigmoid(gate_logit)`, `gate_logit` initialised to −2 (g ≈ 0.12) and the projection zero-initialised — i.e. the lag pathway starts *off* and has to earn its influence.
+* The current coarse SST and mask still enter every U-Net resolution.
+* Before lag encoding, the ocean-only mean is removed independently from every coarse block of the previous field. The lag path therefore carries fronts and texture, not yesterday's block-scale temperature.
+* `Dropout2d(lag_dropout = 0.10)` remains and whole-path dropout is raised to `0.50`.
+* Gated FiLM is hard-capped by `lag_guidance_scale = 0.25`; learned gates cannot make the lag path authoritative.
+* At the end of every one-day sample, `project_to_coarse` adds a constant within each valid ocean block so its mean exactly equals the current coarse input. This leaves every within-block anomaly unchanged and is outside the rectified-flow velocity loss.
 
 Given the measured lag-1 correlation of 0.99993, **the headline diagnostic for this experiment is `skill_vs_persistence`** (logged every validation): `1 − MSE(model) / MSE(persistence)`. A value ≤ 0 means the model is not beating "yesterday's field" and the lag pathway needs further throttling.
 
@@ -156,9 +158,7 @@ loss = masked_mse(v_θ(z, cond, mask, t[, y_prev]), u)
 
 Samplers: `euler`, `heun` (2 evaluations/step, default), `ab2` (2nd order, 1 evaluation/step). All re-apply the mask after every update so land can never drift. `heun_sample` is deliberately **not** wrapped in `no_grad` so it doubles as the differentiable rollout solver.
 
-**Single-step rollout** (`flow.single_step_rollout_loss`): unroll `heun_sample` for `rollout_train_steps = 4` steps *with gradient*, compare the generated day to the truth with `masked_mse`, add it to the velocity loss with weight `rollout_weight` after `rollout_start_step`. This is the state-space objective, mirroring "Experiment B" (`detached_spatial_rollout_loss`) in `Autoregressive_Model/src/flow.py`, restricted to a horizon of one as requested.
-
-`flow.rollout` provides free-running multi-day generation for the evaluation callbacks.
+The differentiable single-step rollout penalty has been retired. AR training now uses the same masked velocity objective as ordinary flow matching. `flow.rollout` remains only as a multi-day diagnostic and projects every generated day onto that day's coarse input before chaining it as lag guidance.
 
 ### 4.4 GAN — `src/model_gan.py`, `src/train_gan.py`
 
@@ -206,7 +206,10 @@ SSTDownscaling/
 | `src/data.py` | `Autoregressive_Model/src/data.py` | Split-safe window construction, preload/lazy duality, worker-safe handles | `netCDF4` instead of `h5py`; single channel; mask channels; NaN→0 after normalisation |
 | `src/losses.py` | `Autoregressive_Model/src/losses.py` (spectral loss) | `spectral_amplitude_loss` shape | **All losses are masked**; added hinge GAN losses and the (inert) conservation loss |
 | `src/model.py` | `NZ_domain_CPM/.../models.py` + `Autoregressive_Model/src/model.py` | `ResidualBlock`+FiLM, `TimeEmbedding`, `ChannelAttention`, `SelfAttention`, `LagEncoder`, `GatedFiLM`, `group_count` | Multi-level coarse re-injection for super-resolution; zero-init output paths; `scaled_dot_product_attention` |
-| `src/flow.py` | `Autoregressive_Model/src/flow.py`, `NZ_domain_CPM/.../flow.py` | Rectified-flow loss, Heun / AB samplers, rollout structure | Masked noise/state/velocity; single-step rollout only |
+| `src/flow.py` | `Autoregressive_Model/src/flow.py`, `NZ_domain_CPM/.../flow.py` | Rectified-flow loss, Heun / AB samplers, rollout structure | Masked noise/state/velocity; optional coarse projection at generated-field boundaries |
+| `src/consistency.py` | *new* | — | Differentiable block means, lag high-pass decomposition, and exact coarse-authority projection |
+| `derived/convert_access_to_training_grid.py` | supplied workflow, repaired as standalone | Seasonal-anomaly conversion onto the established training predictor grid with atomic output |
+| `src/infer_access_cm2.py` | *new* | — | Validation and resumable inference from the already-converted ACCESS-CM2 predictor; no remapping |
 | `src/model_gan.py` | *new* | — | PatchGAN + spectral norm, masked logits, residual generator |
 | `src/callbacks.py` | `Autoregressive_Model/src/callbacks.py`, `NZ_domain_CPM/.../callbacks.py` | Preview grid, atomic NetCDF write, metrics JSON | 5-panel layout incl. coarse input and radial power spectrum; rollout-skill plot |
 | `src/engine.py` | `Autoregressive_Model/src/train.py`, `NZ_domain_CPM/.../train.py` | EMA, resumable checkpoints, wall-clock guard, status.json handshake | Factored into a shared engine used by all three trainers |
@@ -239,7 +242,7 @@ Shared keys (identical meaning in all three configs):
 | `sampler` / `preview_sampler_steps` | `heun` / `25` | Inference solver |
 | `lambda_conservation` | `0.0` | Low→high constraint, **off** for round one |
 
-Autoregressive-only: `horizon` (1), `lag_base_channels` (16), `lag_dropout` / `lag_path_dropout` (0.10), `rollout_weight` (0.1), `rollout_start_step` (20000), `rollout_every` (4), `rollout_train_steps` (4), `rollout_days` (10), `rollout_netcdf_every` (10000).
+Autoregressive-only: `horizon` (1), `lag_base_channels` (16), `lag_dropout` (0.10), `lag_path_dropout` (0.50), `lag_guidance_scale` (0.25), `enforce_coarse_consistency` (true), `rollout_days` (10), and `rollout_netcdf_every` (10000). Rollouts are diagnostics, not a training loss.
 
 GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base_channels` (32), `discriminator_levels` (4), `discriminator_learning_rate` (1e-4), `critic_steps` (1), `lambda_content` (10.0), `lambda_adversarial` (1.0), `adversarial_start_step` (2000).
 
@@ -256,11 +259,11 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] `src/data.py` — `DerivedProduct`, worker-safe `_SourceReader`, `SuperResolutionDataset`, `AutoregressiveSuperResolutionDataset`, `build_dataset` factory; NaN→0 after normalisation; fingerprint verification.
 - [x] `src/losses.py` — masked mean/MSE/L1/RMSE/bias, masked spectral loss, inert conservation loss, hinge GAN losses.
 - [x] `src/model.py` — shared backbone, autoregressive variant with throttled lag pathway, `build_model` factory.
-- [x] `src/flow.py` — masked rectified-flow loss, Euler/Heun/AB2 samplers, free-running rollout, differentiable single-step rollout loss.
+- [x] `src/flow.py` — masked rectified-flow loss, Euler/Heun/AB2 samplers, free-running diagnostic rollout, and optional coarse projection.
 - [x] `src/callbacks.py` — 5-panel preview (coarse / truth / generated / error / radial spectrum), loss curves, NetCDF writers for samples and rollouts, rollout-skill plot, metrics JSON.
 - [x] `src/engine.py` — EMA, warmup+cosine schedule, resumable checkpoints with RNG state, non-finite guards, wall-clock guard, `status.json`, deterministic preview batching.
 - [x] `src/train_flow.py` — experiment 1 end to end.
-- [x] `src/train_flow_ar.py` — experiment 2 end to end, including `skill_vs_persistence` and free-running rollout products.
+- [x] `src/train_flow_ar.py` — experiment 2 end to end, including `skill_vs_persistence` and free-running diagnostic products.
 
 ## PART B — Remaining tasks
 
@@ -269,16 +272,26 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] **B3** `src/evaluate.py` — offline test-split evaluation for any run directory: RMSE/MAE/bias/spectra, sampler-step ablation, multi-day NetCDF.
 - [x] **B4** `src/validate_data.py` — standalone preflight: assert no NaN reaches a batch, masks agree, statistics are sane, splits are disjoint and gapless.
 - [x] **B5** `configs/flow_sr.json`, `configs/flow_ar.json`, `configs/gan_sr.json`.
-- [x] **B6** `tests/` — the full matrix in Part C (104 tests, including conditioning-ablation and GAN critic-freeze regressions).
+- [x] **B6** `tests/` — the full matrix in Part C (including conditioning-ablation, coarse-authority, converted-ACCESS, solver, and GAN critic-freeze regressions).
 - [x] **B7** `jobs/*.pbs` — `preprocess.pbs` (shortq), `cpu_tests.pbs` (shortq), `gpu_smoke.pbs` (h200q), `train_flow.pbs` / `train_flow_ar.pbs` / `train_gan.pbs` (h200q, self-resubmitting on `status == "checkpointed"`).
 - [x] **B8** Real preprocessing complete: mean 19.833256 °C, std 8.699326 °C, 32 × 32 coarse grid, 716 valid coarse cells.
-- [x] **B9** Full CPU suite green: 104 tests, including the two-worker DataLoader check on a PBS node.
+- [x] **B9** Full CPU suite green: 131 passed, 1 restricted-sandbox skip (2026-08-27); the two-worker DataLoader check remains verified on a PBS node.
 - [x] **B10** Real-grid CPU smoke training complete for all three models (3 steps each); every run produced PNG, NetCDF, checkpoint, weights, history, and passing status. AR rollout and GAN adversarial paths were exercised.
 - [x] **B11** GPU smoke passed on an NVIDIA H200 in job `6406137`: production-batch forward/backward for all models, 11.93 GiB maximum peak allocation, 25-step Heun in 1.91 s, 10-day AR rollout in 19.34 s, and a verified NetCDF product.
 - [x] **B12** `README.md`, `AGENTS.md`, `.gitignore`, Git repository, and initial commit `8c0bb9c` created.
 - [x] **B13** 1000-step full-grid GPU flow smoke passed in job `6406393`: 997 resumed steps in 80.8 s (~12.3 steps/s), preview + NetCDF written, and the raw model achieved 0.70 °C RMSE with 99.3 % skill versus same-noise coarse-SST ablation. The initially noisy preview was traced to expected fixed-decay EMA lag, not a broken conditioning path.
-- [ ] **B14** Complete the three 120,000-step production runs. Active jobs: flow `6406390`, autoregressive flow `6406391`, and corrected GAN `6406398`; each job checkpoints and self-resubmits at the 23-hour guard until complete.
-- [x] **B15** GAN adversarial recovery verified. The step-4000 audit found generator-loss gradients contaminating critic updates; job `6406392` was stopped, the critic is now frozen during generator updates, a regression test was added, and job `6406398` resumed. By step 6000 critic loss recovered from 10.28 to 0.45, with real/fake logits separating from +9.06/+9.06 to +3.50/−3.09 and finite validation output.
+- [ ] **B14** Complete production runs. Plain flow completed 120,000 steps. The original AR job `6406391` and GAN job `6406398` were canceled on 2026-08-27 because their approaches were rejected; their outputs are retired. No replacement production job is active.
+- [x] **B15** GAN adversarial recovery verified before the experiment was canceled. The step-4000 audit found generator-loss gradients contaminating critic updates; the critic was frozen during generator updates, a regression test was added, and a fresh GAN-v2 CPU smoke passed.
+- [x] **B16** Coarse-guided AR replacement: focused CPU tests, full CPU suite, three CPU smokes, real-data validation, and the new H200 smoke all pass; the old job is canceled and no AR production job is active.
+- [x] **B17** Full-test `flow_sr` inference completed by job `6406503`: 1,461 consecutive test days, 50-step Heun, atomic NetCDF and metrics integrity checks passed.
+- [x] **B18** Retired the inference-time ACCESS remapper after receiving `derived/sst_downscaling_access_converted.nc`. The supplied conversion method is now a standalone tracked CLI at `derived/convert_access_to_training_grid.py`; inference only validates and consumes its 32×32 output.
+- [x] **B19** The converted ACCESS product was audited: `sst_lr(time=51135, lat_lr=32, lon_lr=32)`, 1960-01-01 through 2099-12-31, with exactly 716 finite training-ocean cells in each probed field.
+- [ ] **B20** Run and verify converted-ACCESS inference for the exact ten-year historical (1980–1989) and future (2080–2089) periods using the original `flow_sr` EMA, AB3/AM3 predictor-corrector, and 75 steps.
+- [x] **B21** Verified the plain-flow test split independently from the stored derived time axis: train (1979–2008; 10,958 days), validation (2009–2010; 730 days), and test (2011–2014; 1,461 days) have zero overlap. The normalization provenance contains the training range only.
+- [ ] **B22** Plain-flow continuation job `6406705` is running from step 120,000 to 220,000 in the separate `runs/flow_sr_continue_220k` run after its H200 fork smoke passed. It preserves model/EMA, AdamW state, RNG and the active 5e-6 LR; immutable 10,000-step weight snapshots begin at step 130,000.
+- [x] **B23** Job `6406703` compared 100-step Heun and AB2 on the same first 30 test days and identical initial noise. Both had zero non-finite ocean pixels; AB2 was 2.04x faster and had 0.3721 °C RMSE versus Heun's 0.3759 °C. Metrics, atomic NetCDF, and the solver-difference figure passed integrity checks.
+- [x] **B24** Added and validated an AB3/AM3 predictor-corrector sampler whose two-step velocity history is confined to one ODE sample. The 100-step, same-noise 30-day comparison passed: AB3-PC RMSE was 0.3749 °C versus 0.3759 °C for Heun and 0.3721 °C for AB2, with zero non-finite ocean pixels.
+- [ ] **B25** Job `6406740` is running all 1,461 test days with the plain-flow EMA weights using only the AB3/AM3 predictor-corrector at 75 steps. Earlier full-test and solver-comparison outputs are preserved under solver-specific filenames.
 
 ## PART C — Exhaustive test matrix
 
@@ -439,7 +452,7 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 5. Job fails loudly (non-zero exit) on any non-finite loss.
 
 ### C13 Acceptance criteria before launching production runs
-- [x] Whole `pixi run test` suite green on CPU (104 tests, 2026-08-27).
+- [x] Whole `pixi run test` suite green on CPU (120 passed, 1 restricted-sandbox skip, 2026-08-27).
 - [x] `pixi run validate-data` green on the real file (all nine checks passed).
 - [x] All three CPU smoke trainings produce PNG + NetCDF + checkpoint.
 - [x] `jobs/gpu_smoke.pbs` completes on h200q within its walltime and fits in memory (job `6406137`, peak 11.93 GiB).
@@ -474,6 +487,6 @@ Each training job inspects `runs/<name>/status.json` on exit and re-submits itse
 | AR model degenerates to persistence | Path dropout + gated FiLM starting near zero; `skill_vs_persistence` tracked every validation |
 | 16× super-resolution is under-determined | Flow matching and the GAN are both generative; the spectral panel in every preview shows whether fine scales are actually produced |
 | 512 × 512 activations exhaust GPU memory | `base_channels`, `batch_size`, and `levels` are config fields; `jobs/gpu_smoke.pbs` reports peak memory before any long run |
-| Differentiable rollout is expensive | `rollout_train_steps = 4`, `rollout_every = 4`, `rollout_batch_size = 2`, and it starts only after `rollout_start_step` |
+| AR degenerates to persistence | Remove lag block means, cap lag FiLM at 0.25, use 50% path dropout, enforce current coarse means, and report an evolution ratio in diagnostic sequences |
 | GAN divergence | Spectral norm, hinge loss, delayed adversarial start, `λ_content = 10` dominating early training |
 | NETCDF3 handles in DataLoader workers | Handles are opened lazily per process and excluded from pickling (`_SourceReader.__getstate__`) |

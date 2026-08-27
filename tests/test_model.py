@@ -108,8 +108,28 @@ def test_previous_state_matters():
     model = _train_one_step(make_ar(path_dropout=0.0), (state, condition, mask, previous, t))
     model.eval()
     a = model(state, condition, mask, previous, t)
-    b = model(state, condition, mask, previous + 3.0, t)
+    # Only within-block structure is allowed through the lag path; a spatial
+    # pattern therefore matters even though a blockwise offset does not.
+    pattern = torch.zeros_like(previous)
+    pattern[..., ::2, ::2] = 3.0
+    b = model(state, condition, mask, previous + pattern, t)
     assert float((a - b).abs().max()) > 1e-6
+
+
+def test_previous_block_mean_is_not_lag_guidance():
+    state, condition, mask, t = make_inputs()
+    previous = torch.randn_like(state)
+    model = _train_one_step(
+        make_ar(path_dropout=0.0), (state, condition, mask, previous, t)
+    )
+    model.eval()
+    block_offsets = torch.randn_like(condition[:, :1])
+    block_offsets = torch.nn.functional.interpolate(
+        block_offsets, size=previous.shape[-2:], mode="nearest"
+    )
+    a = model(state, condition, mask, previous, t)
+    b = model(state, condition, mask, previous + block_offsets * mask, t)
+    torch.testing.assert_close(a, b, atol=2e-6, rtol=0)
 
 
 def test_lag_path_dropout_is_active_in_train_only():

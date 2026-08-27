@@ -1,0 +1,10 @@
+#!/bin/bash
+#PBS -N flow-solvers3
+#PBS -q h200q
+#PBS -l select=1:ncpus=8:mem=96GB:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+pixi run -e gpu python src/compare_flow_solvers.py \
+  --run runs/flow_sr --days 30 --steps 100 --batch-size 4 --device cuda

@@ -1,6 +1,6 @@
 import torch
 
-from losses import hinge_discriminator_loss, hinge_generator_loss, masked_mse
+from losses import feature_matching_loss, hinge_discriminator_loss, hinge_generator_loss, masked_mse
 from model_gan import Discriminator, Generator
 from train_gan import set_requires_grad
 
@@ -11,7 +11,7 @@ def inputs():
     return condition, mask, target
 
 
-def generator(): return Generator(base_channels=4, levels=2, noise_channels=2, attention=False)
+def generator(): return Generator(base_channels=4, levels=3, noise_channels=2, attention=False, rrdb_blocks=1, growth_channels=2)
 def discriminator(): return Discriminator(base_channels=4, levels=2)
 
 
@@ -24,7 +24,7 @@ def test_generator_output_shape_mask_and_bilinear_baseline():
 
 def test_generator_noise_changes_output_after_perturbation():
     condition, mask, _ = inputs(); model = generator()
-    with torch.no_grad(): model.head.weight.normal_(std=0.1); model.backbone.output.weight.normal_(std=0.1)
+    with torch.no_grad(): model.head[-1].weight.normal_(std=0.1)
     assert not torch.equal(model(condition, mask, torch.randn(2, 2, 32, 32)), model(condition, mask, torch.randn(2, 2, 32, 32)))
 
 
@@ -32,7 +32,16 @@ def test_discriminator_output_and_land_masking():
     condition, mask, target = inputs(); model = discriminator().eval()
     changed = target.clone(); changed[mask == 0] = 1e6
     first = model(target, condition, mask); second = model(changed, condition, mask)
-    assert first.shape == (2, 1, 8, 8); torch.testing.assert_close(first, second)
+    assert first.shape[0] == 2 and first.ndim == 2; torch.testing.assert_close(first, second)
+
+
+def test_multiscale_features_support_masked_feature_matching():
+    condition, mask, target = inputs(); model = discriminator().eval()
+    fake = target + 0.1 * mask
+    _, fake_features, feature_masks = model(fake, condition, mask, return_features=True)
+    _, real_features, _ = model(target, condition, mask, return_features=True)
+    loss = feature_matching_loss(fake_features, real_features, feature_masks)
+    assert torch.isfinite(loss) and float(loss) > 0
 
 
 def test_one_gan_step_runs_and_content_is_single_sample():

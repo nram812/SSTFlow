@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N sst-access-converted
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+
+config=configs/access_cm2_inference.json
+pixi run -e gpu python -u src/infer_access_cm2.py \
+  --config "$config" --period-name historical --device cuda
+pixi run -e gpu python -u src/infer_access_cm2.py \
+  --config "$config" --period-name future --device cuda

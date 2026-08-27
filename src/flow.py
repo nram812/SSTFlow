@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import torch
 
+from consistency import project_to_coarse
 from losses import apply_mask, masked_mse
 
 #: Samplers exposed to configs and the command line.
-SAMPLERS = ("euler", "heun", "ab2")
+SAMPLERS = ("euler", "heun", "ab2", "ab3_pc")
 
 
 def masked_noise(
@@ -175,8 +176,93 @@ def ab2_sample(
     return state
 
 
+def ab3_pc_sample(
+    model,
+    initial_noise: torch.Tensor,
+    condition: torch.Tensor,
+    mask: torch.Tensor,
+    steps: int,
+    previous_state: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """AB3/AM3 predictor-corrector with corrected-state velocity history.
+
+    Heun starts the first interval.  The second interval uses an AB2 predictor,
+    and subsequent intervals use an AB3 predictor.  Every prediction is
+    corrected with the third-order Adams-Moulton formula.  Velocities at the
+    corrected states are evaluated and retained for the next internal ODE
+    substep; this history is local to this call and never crosses SST samples
+    or days.  The method uses two model evaluations per integration step.
+    """
+    if steps < 1:
+        raise ValueError("The sampler needs at least one step")
+    state = apply_mask(initial_noise, mask)
+    dt = 1.0 / steps
+    velocity_history = [
+        _call(
+            model,
+            state,
+            condition,
+            mask,
+            _time_tensor(0.0, state),
+            previous_state,
+        )
+    ]
+    for index in range(steps):
+        current_velocity = velocity_history[-1]
+        if index == 0:
+            predicted = state + dt * current_velocity
+        elif index == 1:
+            predicted = state + dt * (
+                1.5 * current_velocity - 0.5 * velocity_history[-2]
+            )
+        else:
+            predicted = state + (dt / 12.0) * (
+                23.0 * current_velocity
+                - 16.0 * velocity_history[-2]
+                + 5.0 * velocity_history[-3]
+            )
+        predicted = apply_mask(predicted, mask)
+        following = min((index + 1) * dt, 1.0)
+        predicted_velocity = _call(
+            model,
+            predicted,
+            condition,
+            mask,
+            _time_tensor(following, state),
+            previous_state,
+        )
+        if index == 0:
+            state = state + 0.5 * dt * (
+                current_velocity + predicted_velocity
+            )
+        else:
+            state = state + (dt / 12.0) * (
+                5.0 * predicted_velocity
+                + 8.0 * current_velocity
+                - velocity_history[-2]
+            )
+        state = apply_mask(state, mask)
+        if index + 1 < steps:
+            corrected_velocity = _call(
+                model,
+                state,
+                condition,
+                mask,
+                _time_tensor(following, state),
+                previous_state,
+            )
+            velocity_history.append(corrected_velocity)
+            velocity_history = velocity_history[-3:]
+    return state
+
+
 def get_sampler(name: str):
-    samplers = {"euler": euler_sample, "heun": heun_sample, "ab2": ab2_sample}
+    samplers = {
+        "euler": euler_sample,
+        "heun": heun_sample,
+        "ab2": ab2_sample,
+        "ab3_pc": ab3_pc_sample,
+    }
     if name not in samplers:
         raise ValueError(f"Unknown sampler {name!r}; choose from {SAMPLERS}")
     return samplers[name]
@@ -193,14 +279,18 @@ def sample(
     generator=None,
     device=None,
     dtype=torch.float32,
+    enforce_coarse_consistency: bool = False,
 ) -> torch.Tensor:
     """Draw one masked sample for each element of ``condition``."""
     device = device or condition.device
     reference = torch.zeros(shape, device=device, dtype=dtype)
     noise = masked_noise(reference, mask, generator)
-    return get_sampler(sampler)(
+    result = get_sampler(sampler)(
         model, noise, condition, mask, steps, previous_state
     )
+    if enforce_coarse_consistency:
+        result = project_to_coarse(result, condition, mask)
+    return result
 
 
 @torch.no_grad()
@@ -212,6 +302,7 @@ def rollout(
     steps: int = 25,
     sampler: str = "heun",
     generator=None,
+    enforce_coarse_consistency: bool = False,
 ) -> torch.Tensor:
     """Free-running autoregressive rollout.
 
@@ -231,6 +322,8 @@ def rollout(
         state = get_sampler(sampler)(
             model, noise, conditions[:, lead], mask, steps, state
         )
+        if enforce_coarse_consistency:
+            state = project_to_coarse(state, conditions[:, lead], mask)
         predictions.append(state.clone())
     return torch.stack(predictions, dim=1)
 
@@ -243,6 +336,7 @@ def single_step_rollout_loss(
     mask: torch.Tensor,
     steps: int = 4,
     generator=None,
+    enforce_coarse_consistency: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Differentiable single-step rollout: sample one day, score it in space.
 
@@ -255,4 +349,6 @@ def single_step_rollout_loss(
     prediction = heun_sample(
         model, noise, condition, mask, steps, previous_state
     )
+    if enforce_coarse_consistency:
+        prediction = project_to_coarse(prediction, condition, mask)
     return masked_mse(prediction, target, mask), prediction

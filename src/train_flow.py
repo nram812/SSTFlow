@@ -165,9 +165,12 @@ def train(
     model = build_model(config).to(device)
     ema = engine.ExponentialMovingAverage(model, float(config.get("ema_decay", 0.999)))
     ema.module.to(device)
+    active_learning_rate = float(
+        config.get("continuation_learning_rate", config["learning_rate"])
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(config["learning_rate"]),
+        lr=active_learning_rate,
         weight_decay=float(config.get("weight_decay", 1.0e-5)),
         betas=(0.9, 0.99),
     )
@@ -180,6 +183,8 @@ def train(
         {"model": optimizer},
         {"model": scheduler},
         device,
+        resume_from=config.get("resume_from"),
+        continuation_learning_rate=active_learning_rate,
     )
 
     max_steps = int(smoke_steps or config["max_steps"])

@@ -42,6 +42,7 @@ _RELATIVE_PATH_KEYS = (
     "normalization_cache",
     "output_dir",
     "smoke_output_dir",
+    "resume_from",
 )
 
 

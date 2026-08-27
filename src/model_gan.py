@@ -1,168 +1,205 @@
-"""PyTorch conditional GAN baseline for SST super-resolution.
+"""Compact, fine-detail conditional GAN for 16x SST super-resolution.
 
-The generator reuses the flow U-Net backbone with the flow time pinned to one,
-so the three experiments share an identical receptive field and parameter
-budget.  It maps ``(coarse condition, ocean mask, latent noise)`` directly to
-the high-resolution residual around the bilinearly upsampled predictor, which is
-a much easier target than the full field and keeps early training stable.
-
-Following the request, the content loss is a **single** masked MSE between one
-generated sample and the truth - not the ensemble-mean MSE used by
-Harris et al. (2022) style implementations.
+The generator follows the ESRGAN residual-in-residual dense-block principle,
+but enlarges progressively so most computation stays off the 512x512 grid. A
+bilinear SST skip preserves large scales while two spectral-normalised critics
+judge native and half-resolution structure.
 """
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import SuperResolutionFlowUNet, group_count, resize_to
+
+def resize(values: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    return F.interpolate(values, size=size, mode="bilinear", align_corners=False)
+
+
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, channels: int, growth_channels: int):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.Conv2d(channels + i * growth_channels, growth_channels, 3, padding=1)
+            for i in range(4)
+        ])
+        self.fuse = nn.Conv2d(channels + 4 * growth_channels, channels, 3, padding=1)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        features = [values]
+        for layer in self.layers:
+            features.append(F.leaky_relu(layer(torch.cat(features, dim=1)), 0.2))
+        return values + 0.2 * self.fuse(torch.cat(features, dim=1))
+
+
+class RRDB(nn.Module):
+    def __init__(self, channels: int, growth_channels: int):
+        super().__init__()
+        self.blocks = nn.Sequential(*[
+            ResidualDenseBlock(channels, growth_channels) for _ in range(3)
+        ])
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values + 0.2 * self.blocks(values)
+
+
+class UpsampleBlock(nn.Module):
+    """Artifact-resistant nearest-neighbour 2x upsampling plus refinement."""
+
+    def __init__(self, channels: int, condition_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.condition = nn.Conv2d(condition_channels + 1, channels, 1)
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+    def forward(self, values, condition, mask):
+        size = (values.shape[-2] * 2, values.shape[-1] * 2)
+        values = F.interpolate(values, size=size, mode="nearest")
+        values = F.leaky_relu(self.conv(values), 0.2)
+        context = torch.cat((resize(condition, size), resize(mask, size)), dim=1)
+        return values + self.refine(values + self.condition(context))
 
 
 class Generator(nn.Module):
-    """Conditional generator built on the shared super-resolution backbone."""
+    """Progressive compact RRDB generator with a physical coarse-field skip."""
 
-    def __init__(
-        self,
-        base_channels: int = 32,
-        levels: int = 4,
-        condition_channels: int = 2,
-        target_channels: int = 1,
-        noise_channels: int = 4,
-        attention: bool = True,
-        attention_heads: int = 4,
-        residual: bool = True,
-    ):
+    def __init__(self, base_channels=48, levels=4, condition_channels=2,
+                 target_channels=1, noise_channels=4, attention=True,
+                 attention_heads=4, residual=True, rrdb_blocks=4,
+                 growth_channels=24):
         super().__init__()
+        del attention, attention_heads
         self.noise_channels = int(noise_channels)
         self.target_channels = int(target_channels)
-        self.condition_channels = int(condition_channels)
         self.residual = bool(residual)
-        self.backbone = SuperResolutionFlowUNet(
-            base_channels=base_channels,
-            levels=levels,
-            condition_channels=condition_channels,
-            target_channels=self.noise_channels,
-            attention=attention,
-            attention_heads=attention_heads,
+        self.levels = int(levels)
+        self.stem = nn.Conv2d(condition_channels + noise_channels + 1, base_channels, 3, padding=1)
+        self.trunk = nn.Sequential(*[
+            RRDB(base_channels, growth_channels) for _ in range(rrdb_blocks)
+        ])
+        self.trunk_fuse = nn.Conv2d(base_channels, base_channels, 3, padding=1)
+        self.upsample = nn.ModuleList([
+            UpsampleBlock(base_channels, condition_channels) for _ in range(levels)
+        ])
+        self.head = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(base_channels, target_channels, 3, padding=1),
         )
-        # The backbone emits `noise_channels` maps; project them to the target.
-        self.head = nn.Conv2d(self.noise_channels, self.target_channels, 1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
 
-    def sample_noise(
-        self, condition: torch.Tensor, shape: tuple[int, int], generator=None
-    ) -> torch.Tensor:
-        return torch.randn(
-            (condition.shape[0], self.noise_channels, *shape),
-            device=condition.device,
-            dtype=condition.dtype,
-            generator=generator,
-        )
+    def sample_noise(self, condition, shape=None, generator=None):
+        del shape
+        return torch.randn((condition.shape[0], self.noise_channels, *condition.shape[-2:]),
+                           device=condition.device, dtype=condition.dtype,
+                           generator=generator)
 
-    def forward(
-        self,
-        condition: torch.Tensor,
-        ocean_mask: torch.Tensor,
-        noise: torch.Tensor | None = None,
-        generator=None,
-    ) -> torch.Tensor:
-        shape = tuple(int(value) for value in ocean_mask.shape[-2:])
+    def forward(self, condition, ocean_mask, noise=None, generator=None):
+        coarse_shape = tuple(int(v) for v in condition.shape[-2:])
+        target_shape = tuple(int(v) for v in ocean_mask.shape[-2:])
+        factor = 2 ** self.levels
+        if (coarse_shape[0] * factor, coarse_shape[1] * factor) != target_shape:
+            raise ValueError(
+                f"levels={self.levels} imply {coarse_shape[0]*factor}x"
+                f"{coarse_shape[1]*factor}, mask is {target_shape}"
+            )
         if noise is None:
-            noise = self.sample_noise(condition, shape, generator)
-        noise = noise * ocean_mask
-        ones = torch.ones(
-            condition.shape[0], device=condition.device, dtype=condition.dtype
-        )
-        hidden = self.backbone(noise, condition, ocean_mask, ones)
+            noise = self.sample_noise(condition, generator=generator)
+        elif noise.shape[-2:] != coarse_shape:
+            noise = resize(noise, coarse_shape)
+        coarse_mask = resize(ocean_mask, coarse_shape)
+        hidden = self.stem(torch.cat((condition, noise, coarse_mask), dim=1))
+        hidden = hidden + self.trunk_fuse(self.trunk(hidden))
+        for block in self.upsample:
+            hidden = block(hidden, condition, ocean_mask)
         output = self.head(hidden)
         if self.residual:
-            baseline = resize_to(condition[:, : self.target_channels], output)
-            output = output + baseline
+            output = output + resize(condition[:, :self.target_channels], target_shape)
         return output * ocean_mask
 
 
 class SpectralConvBlock(nn.Module):
-    """Strided, spectrally normalised convolution used by the critic."""
-
-    def __init__(self, input_channels: int, output_channels: int, stride: int = 2):
+    def __init__(self, input_channels: int, output_channels: int):
         super().__init__()
         self.conv = nn.utils.parametrizations.spectral_norm(
-            nn.Conv2d(input_channels, output_channels, 4, stride=stride, padding=1)
+            nn.Conv2d(input_channels, output_channels, 4, stride=2, padding=1)
         )
-        self.norm = nn.GroupNorm(group_count(output_channels), output_channels)
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        return F.leaky_relu(self.norm(self.conv(values)), 0.2)
+    def forward(self, values):
+        return F.leaky_relu(self.conv(values), 0.2, inplace=True)
 
 
-class Discriminator(nn.Module):
-    """Conditional PatchGAN critic.
-
-    The critic sees the candidate field, the bilinearly upsampled coarse
-    predictor, and the ocean mask.  Its logit map is multiplied by a downsampled
-    ocean mask before reduction so land patches cannot influence the score.
-    """
-
-    def __init__(
-        self,
-        base_channels: int = 32,
-        levels: int = 4,
-        condition_channels: int = 2,
-        target_channels: int = 1,
-    ):
+class PatchCritic(nn.Module):
+    def __init__(self, input_channels: int, base_channels: int, levels: int):
         super().__init__()
-        channels = [base_channels * min(2**level, 8) for level in range(levels)]
-        input_channels = target_channels + condition_channels + 1
-        blocks = [
-            nn.utils.parametrizations.spectral_norm(
-                nn.Conv2d(input_channels, channels[0], 4, stride=2, padding=1)
-            )
-        ]
-        self.stem = nn.Sequential(*blocks)
-        self.blocks = nn.ModuleList(
-            [
-                SpectralConvBlock(channels[level - 1], channels[level])
-                for level in range(1, levels)
-            ]
-        )
+        channels = [base_channels * min(2**i, 8) for i in range(levels)]
+        self.stem = SpectralConvBlock(input_channels, channels[0])
+        self.blocks = nn.ModuleList([
+            SpectralConvBlock(channels[i - 1], channels[i]) for i in range(1, levels)
+        ])
         self.output = nn.utils.parametrizations.spectral_norm(
             nn.Conv2d(channels[-1], 1, 3, padding=1)
         )
-        self.downsample_factor = 2**levels
 
-    def forward(
-        self,
-        field: torch.Tensor,
-        condition: torch.Tensor,
-        ocean_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden = torch.cat(
-            (field * ocean_mask, resize_to(condition, field), ocean_mask), dim=1
-        )
-        hidden = F.leaky_relu(self.stem(hidden), 0.2)
+    def forward(self, values, mask):
+        features = []
+        hidden = self.stem(values)
+        features.append(hidden)
         for block in self.blocks:
             hidden = block(hidden)
+            features.append(hidden)
         logits = self.output(hidden)
-        patch_mask = (
-            F.avg_pool2d(ocean_mask, self.downsample_factor) > 0.0
-        ).to(logits.dtype)
-        patch_mask = resize_to(patch_mask, logits)
-        return logits * patch_mask
+        patch_mask = (resize(mask, logits.shape[-2:]) > 0.5).to(logits.dtype)
+        return logits * patch_mask, features
+
+
+class Discriminator(nn.Module):
+    """Native/half-resolution conditional PatchGAN critics."""
+
+    def __init__(self, base_channels=32, levels=4, condition_channels=2,
+                 target_channels=1, scales=2):
+        super().__init__()
+        inputs = target_channels + condition_channels + 1
+        self.critics = nn.ModuleList([
+            PatchCritic(inputs, base_channels, levels) for _ in range(scales)
+        ])
+
+    def forward(self, field, condition, ocean_mask, return_features=False):
+        values = torch.cat((field * ocean_mask, resize(condition, field.shape[-2:]), ocean_mask), dim=1)
+        mask = ocean_mask
+        logits, all_features, all_masks = [], [], []
+        for index, critic in enumerate(self.critics):
+            if index:
+                values = F.avg_pool2d(values, 2)
+                mask = F.avg_pool2d(mask, 2)
+            score, features = critic(values, mask)
+            logits.append(score.flatten(1))
+            all_features.extend(features)
+            all_masks.extend([resize(mask, feature.shape[-2:]) for feature in features])
+        joined = torch.cat(logits, dim=1)
+        return (joined, all_features, all_masks) if return_features else joined
 
 
 def build_generator(config: dict) -> Generator:
+    factor = int(config.get("coarsen_factor", 16))
+    levels = int(config.get("generator_upsample_levels", round(math.log2(factor))))
+    if 2 ** levels != factor:
+        raise ValueError(f"coarsen_factor={factor} must be a power of two")
     return Generator(
-        base_channels=int(config.get("base_channels", 32)),
-        levels=int(config.get("levels", 4)),
+        base_channels=int(config.get("generator_channels", config.get("base_channels", 48))),
+        levels=levels,
         condition_channels=int(config.get("condition_channels", 2)),
         target_channels=int(config.get("target_channels", 1)),
         noise_channels=int(config.get("noise_channels", 4)),
-        attention=bool(config.get("attention", True)),
-        attention_heads=int(config.get("attention_heads", 4)),
         residual=bool(config.get("generator_residual", True)),
+        rrdb_blocks=int(config.get("rrdb_blocks", 4)),
+        growth_channels=int(config.get("growth_channels", 24)),
     )
 
 
@@ -172,4 +209,5 @@ def build_discriminator(config: dict) -> Discriminator:
         levels=int(config.get("discriminator_levels", 4)),
         condition_channels=int(config.get("condition_channels", 2)),
         target_channels=int(config.get("target_channels", 1)),
+        scales=int(config.get("discriminator_scales", 2)),
     )

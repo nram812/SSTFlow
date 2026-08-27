@@ -89,6 +89,32 @@ def spectral_amplitude_loss(
     return difference.square().mean()
 
 
+def masked_gradient_loss(
+    prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """Ocean-interior Charbonnier loss on horizontal and vertical gradients."""
+    terms = []
+    for dimension in (-1, -2):
+        predicted = torch.diff(prediction, dim=dimension)
+        observed = torch.diff(target, dim=dimension)
+        first = mask.narrow(dimension, 0, mask.shape[dimension] - 1)
+        second = mask.narrow(dimension, 1, mask.shape[dimension] - 1)
+        edge_mask = first * second
+        terms.append(masked_mean(((predicted - observed).square() + 1.0e-6).sqrt(), edge_mask))
+    return sum(terms) / len(terms)
+
+
+def feature_matching_loss(fake_features, real_features, feature_masks) -> torch.Tensor:
+    """Multi-scale critic-feature supervision with detached real features."""
+    if not (len(fake_features) == len(real_features) == len(feature_masks)):
+        raise ValueError("feature and mask collections must have equal length")
+    terms = [masked_mean((fake - real.detach()).abs(), mask)
+             for fake, real, mask in zip(fake_features, real_features, feature_masks)]
+    if not terms:
+        raise ValueError("at least one feature map is required")
+    return sum(terms) / len(terms)
+
+
 def conservation_loss(
     prediction: torch.Tensor,
     coarse_target: torch.Tensor,

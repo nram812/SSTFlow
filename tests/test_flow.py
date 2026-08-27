@@ -1,7 +1,11 @@
+import math
+
 import pytest
 import torch
 
-from flow import (ab2_sample, euler_sample, flow_matching_loss, get_sampler,
+from compare_flow_solvers import model_evaluations
+
+from flow import (ab2_sample, ab3_pc_sample, euler_sample, flow_matching_loss, get_sampler,
                   heun_sample, masked_noise, rollout, sample,
                   single_step_rollout_loss)
 from model import AutoregressiveSuperResolutionFlowUNet, SuperResolutionFlowUNet
@@ -29,6 +33,11 @@ def test_masked_noise_is_zero_on_land():
     target, _, mask = inputs(); assert torch.count_nonzero(masked_noise(target, mask)[mask == 0]) == 0
 
 
+def test_higher_order_solver_evaluation_counts():
+    assert model_evaluations("heun", 100) == 200
+    assert model_evaluations("ab2", 100) == 100
+
+
 @pytest.mark.parametrize("ar", [False, True])
 def test_loss_is_finite_and_gradient_flows(ar):
     target, condition, mask = inputs(); model = tiny(ar)
@@ -37,8 +46,8 @@ def test_loss_is_finite_and_gradient_flows(ar):
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
-@pytest.mark.parametrize("sampler", [euler_sample, heun_sample, ab2_sample])
-@pytest.mark.parametrize("steps", [1, 2, 5])
+@pytest.mark.parametrize("sampler", [euler_sample, heun_sample, ab2_sample, ab3_pc_sample])
+@pytest.mark.parametrize("steps", [1, 2, 5, 50])
 def test_samplers_shape_finite_and_land(sampler, steps):
     target, condition, mask = inputs(); result = sampler(ConstantVelocity(), target, condition, mask, steps)
     assert result.shape == target.shape and torch.isfinite(result).all()
@@ -55,6 +64,32 @@ def test_sampler_determinism_with_seed():
 def test_heun_matches_constant_velocity():
     target, condition, mask = inputs(); initial = torch.zeros_like(target)
     torch.testing.assert_close(heun_sample(ConstantVelocity(), initial, condition, mask, 5), mask)
+
+
+def test_ab3_pc_matches_constant_velocity_and_uses_two_evaluations_per_step():
+    class CountingVelocity(ConstantVelocity):
+        def __init__(self): super().__init__(); self.calls = 0
+        def forward(self, *args): self.calls += 1; return super().forward(*args)
+    target, condition, mask = inputs(); initial = torch.zeros_like(target)
+    model = CountingVelocity()
+    result = ab3_pc_sample(model, initial, condition, mask, 7)
+    torch.testing.assert_close(result, mask)
+    assert model.calls == 14
+
+
+def test_ab3_pc_has_third_order_convergence_and_resets_history():
+    class ExponentialVelocity(torch.nn.Module):
+        def forward(self, state, condition, mask, flow_time, *args): return state * mask
+    target, condition, mask = inputs(); initial = torch.ones_like(target) * mask
+    model = ExponentialVelocity()
+    coarse = ab3_pc_sample(model, initial, condition, mask, 10)
+    fine = ab3_pc_sample(model, initial, condition, mask, 20)
+    exact = math.e * mask
+    coarse_error = torch.mean(torch.abs(coarse[mask.bool()] - exact[mask.bool()]))
+    fine_error = torch.mean(torch.abs(fine[mask.bool()] - exact[mask.bool()]))
+    assert fine_error < 0.15 * coarse_error
+    repeated = ab3_pc_sample(model, initial, condition, mask, 20)
+    torch.testing.assert_close(fine, repeated, rtol=0, atol=0)
 
 
 def test_invalid_sampler_arguments_raise():

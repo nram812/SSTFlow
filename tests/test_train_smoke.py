@@ -18,9 +18,9 @@ def smoke_runs(synthetic_root):
     flow = make_config(synthetic_root, "smoke_flow_test", **common)
     ar = make_config(synthetic_root, "smoke_ar_test", model_kind="autoregressive",
                      lag_base_channels=2, lag_dropout=0.0, lag_path_dropout=0.0,
-                     rollout_weight=0.1, rollout_start_step=0, rollout_every=1,
-                     rollout_train_steps=1, rollout_days=2, rollout_sampler_steps=1,
-                     rollout_batch_size=1, rollout_netcdf_every=1, horizon=1, **common)
+                     lag_guidance_scale=0.25, enforce_coarse_consistency=True,
+                     rollout_days=2, rollout_sampler_steps=1,
+                     rollout_netcdf_every=1, horizon=1, **common)
     gan = make_config(synthetic_root, "smoke_gan_test", model_kind="gan",
                       noise_channels=2, generator_residual=True,
                       discriminator_base_channels=4, discriminator_levels=2,

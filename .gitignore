@@ -3,10 +3,12 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
-derived/
+derived/*
+!derived/convert_access_to_training_grid.py
 reports/
 runs/
 logs/
+figures/
 *.o[0-9]*
 *.e[0-9]*
 sst_10km_OFAM_historical_Australia.nc
