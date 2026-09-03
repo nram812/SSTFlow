@@ -1,516 +1,161 @@
-"""Script to generate the updated Jupyter Notebook Jupyter_SRDCNN_ResAFNO.20260903.ipynb."""
+"""Build the validation notebook from the canonical SRDN Python modules."""
 
 import json
-import os
+from pathlib import Path
 
-notebook_path = "/esi/project/niwa03712/rampaln/PUBLICATIONS/2026/SSTDownscaling/SRDN/Jupyter_SRDCNN_ResAFNO.20260903.ipynb"
 
-cells = []
+NOTEBOOK_PATH = Path(__file__).with_name("Jupyter_SRDCNN_ResAFNO.20260903.ipynb")
 
-# Cell 1: Markdown Overview
-cells.append({
-    "cell_type": "markdown",
-    "metadata": {},
-    "source": [
-        "# Deterministic SST Super-Resolution Downscaling Network (SRDN)\n",
-        "## Advanced Architecture with ResAFNO Blocks, FiLM Conditioning & Progressive Upsampling\n",
-        "\n",
-        "This notebook presents an updated, state-of-the-art deterministic super-resolution network implemented in **TensorFlow 2.6.0**.\n",
-        "\n",
-        "### Architectural Advancements Integrated from GAN and Flow Matching Models:\n",
-        "1. **AFNO 2D Spectral Mixing**: Incorporates Adaptive Fourier Neural Operator blocks (`tf.signal.rfft2d` / `tf.signal.irfft2d`) with complex block-diagonal weights and softshrink thresholding to capture non-local wavenumber interactions and mesoscale ocean dynamics.\n",
-        "2. **FiLM Conditioning**: Feature-wise Linear Modulation layers that dynamically scale and shift intermediate feature maps conditioned on large-scale background thermal state.\n",
-        "3. **Deep Residual Convolutional Trunk**: Replaces shallow transpose convolutions with 6 deep `AFNOResBlock` units utilizing LayerNorm, GELU, and residual connections.\n",
-        "4. **Progressive Artifact-Free Upsampling**: 3-stage $2\\times$ progressive upsampling ($64\\to 128\\to 256\\to 512$) with refinement convolutions, avoiding the checkerboard artifacts typical of large-stride transpose convolutions.\n",
-        "5. **Physical Coarse Skip Connection**: Direct bilinear skip from coarse input to native grid, ensuring large-scale heat conservation while the network focuses on sub-grid eddy turbulence.\n",
-        "6. **Complexity**: Scaled from the baseline 404,801 parameters (~0.4M) to **4,754,529 parameters (~4.75M, ~5 million target)**."
-    ]
-})
 
-# Cell 2: Code - Imports & System Check
-cells.append({
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": [
-        "# System, Environment & TensorFlow Configuration\n",
-        "import os\n",
-        "import sys\n",
-        "import time\n",
-        "import socket\n",
-        "import numpy as np\n",
-        "import tensorflow as tf\n",
-        "from tensorflow import keras\n",
-        "from tensorflow.keras import layers, models, losses\n",
-        "from tensorflow.keras.regularizers import l2\n",
-        "\n",
-        "print(f\"TensorFlow Version: {tf.__version__}\")\n",
-        "print(f\"Python Executable: {sys.executable}\")\n",
-        "\n",
-        "# Try importing horovod if available in cluster environment\n",
-        "try:\n",
-        "    import horovod.tensorflow.keras as hvd\n",
-        "    hvd_available = True\n",
-        "    print(\"Horovod is available for distributed cluster training.\")\n",
-        "except ImportError:\n",
-        "    hvd_available = False\n",
-        "    print(\"Running in standalone CPU/single-node mode (Horovod not loaded).\")\n"
-    ]
-})
+def markdown(source):
+    return {"cell_type": "markdown", "metadata": {}, "source": source.splitlines(True)}
 
-# Cell 3: Code - Architecture Definitions
-cells.append({
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": [
-        "# =============================================================================\n",
-        "# ARCHITECTURAL COMPONENTS: FiLM, AFNO2D, AFNOResBlock, ProgressiveUpsample\n",
-        "# =============================================================================\n",
-        "\n",
-        "class FiLMLayer(layers.Layer):\n",
-        "    \"\"\"Feature-wise Linear Modulation (FiLM) layer.\n",
-        "    Applies affine transformation conditioned on global conditioning vector:\n",
-        "        y = (1 + gamma) * x + beta\n",
-        "    \"\"\"\n",
-        "    def __init__(self, channels: int, **kwargs):\n",
-        "        super().__init__(**kwargs)\n",
-        "        self.channels = int(channels)\n",
-        "        self.dense = layers.Dense(\n",
-        "            channels * 2,\n",
-        "            kernel_initializer=\"zeros\",\n",
-        "            bias_initializer=\"zeros\",\n",
-        "            name=\"film_dense\"\n",
-        "        )\n",
-        "\n",
-        "    def call(self, x, condition):\n",
-        "        gamma_beta = self.dense(condition)\n",
-        "        gamma, beta = tf.split(gamma_beta, num_or_size_splits=2, axis=-1)\n",
-        "        gamma = tf.reshape(gamma, [-1, 1, 1, self.channels])\n",
-        "        beta = tf.reshape(beta, [-1, 1, 1, self.channels])\n",
-        "        return x * (1.0 + gamma) + beta\n",
-        "\n",
-        "    def get_config(self):\n",
-        "        config = super().get_config()\n",
-        "        config.update({\"channels\": self.channels})\n",
-        "        return config\n",
-        "\n",
-        "\n",
-        "class AFNO2D(layers.Layer):\n",
-        "    \"\"\"Adaptive Fourier Neural Operator (AFNO) 2D Layer.\n",
-        "    Performs global token mixing in the 2D spatial frequency domain with O(N log N) complexity:\n",
-        "      x (B, H, W, C) -> 2D RFFT -> Complex Block-Diagonal MLP -> Softshrink -> 2D IRFFT -> x_out\n",
-        "    \"\"\"\n",
-        "    def __init__(self, embed_dim: int, num_blocks: int = 8, sparsity_threshold: float = 0.01, **kwargs):\n",
-        "        super().__init__(**kwargs)\n",
-        "        assert embed_dim % num_blocks == 0, f\"embed_dim ({embed_dim}) must be divisible by num_blocks ({num_blocks})\"\n",
-        "        self.embed_dim = int(embed_dim)\n",
-        "        self.num_blocks = int(num_blocks)\n",
-        "        self.block_size = int(embed_dim // num_blocks)\n",
-        "        self.sparsity_threshold = float(sparsity_threshold)\n",
-        "\n",
-        "    def build(self, input_shape):\n",
-        "        scale = 0.02\n",
-        "        self.w1_real = self.add_weight(\n",
-        "            name=\"w1_real\",\n",
-        "            shape=(self.num_blocks, self.block_size, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        self.w1_imag = self.add_weight(\n",
-        "            name=\"w1_imag\",\n",
-        "            shape=(self.num_blocks, self.block_size, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        self.b1_real = self.add_weight(\n",
-        "            name=\"b1_real\",\n",
-        "            shape=(1, 1, self.num_blocks, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        self.b1_imag = self.add_weight(\n",
-        "            name=\"b1_imag\",\n",
-        "            shape=(1, 1, self.num_blocks, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "\n",
-        "        self.w2_real = self.add_weight(\n",
-        "            name=\"w2_real\",\n",
-        "            shape=(self.num_blocks, self.block_size, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        self.w2_imag = self.add_weight(\n",
-        "            name=\"w2_imag\",\n",
-        "            shape=(self.num_blocks, self.block_size, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        self.b2_real = self.add_weight(\n",
-        "            name=\"b2_real\",\n",
-        "            shape=(1, 1, self.num_blocks, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        self.b2_imag = self.add_weight(\n",
-        "            name=\"b2_imag\",\n",
-        "            shape=(1, 1, self.num_blocks, self.block_size),\n",
-        "            initializer=tf.random_normal_initializer(stddev=scale),\n",
-        "            trainable=True,\n",
-        "        )\n",
-        "        super().build(input_shape)\n",
-        "\n",
-        "    def _complex_mul(self, xr, xi, wr, wi):\n",
-        "        or_ = tf.einsum('...bi,bio->...bo', xr, wr) - tf.einsum('...bi,bio->...bo', xi, wi)\n",
-        "        oi_ = tf.einsum('...bi,bio->...bo', xr, wi) + tf.einsum('...bi,bio->...bo', xi, wr)\n",
-        "        return or_, oi_\n",
-        "\n",
-        "    def _softshrink(self, val, lambd):\n",
-        "        return tf.sign(val) * tf.maximum(tf.abs(val) - lambd, 0.0)\n",
-        "\n",
-        "    def call(self, x):\n",
-        "        shape = tf.shape(x)\n",
-        "        B, H, W = shape[0], shape[1], shape[2]\n",
-        "        x_r = tf.reshape(x, [B, H, W, self.num_blocks, self.block_size])\n",
-        "        x_p = tf.transpose(x_r, [0, 3, 4, 1, 2])\n",
-        "        x_ft = tf.signal.rfft2d(x_p)\n",
-        "        x_ft = tf.transpose(x_ft, [0, 3, 4, 1, 2])\n",
-        "        shape_ft = tf.shape(x_ft)\n",
-        "        Hf, Wf = shape_ft[1], shape_ft[2]\n",
-        "\n",
-        "        xr = tf.reshape(tf.math.real(x_ft), [B, Hf * Wf, self.num_blocks, self.block_size])\n",
-        "        xi = tf.reshape(tf.math.imag(x_ft), [B, Hf * Wf, self.num_blocks, self.block_size])\n",
-        "\n",
-        "        o_r, o_i = self._complex_mul(xr, xi, self.w1_real, self.w1_imag)\n",
-        "        o_r = o_r + self.b1_real\n",
-        "        o_i = o_i + self.b1_imag\n",
-        "        o_r = self._softshrink(o_r, self.sparsity_threshold)\n",
-        "        o_i = self._softshrink(o_i, self.sparsity_threshold)\n",
-        "\n",
-        "        o_r, o_i = self._complex_mul(o_r, o_i, self.w2_real, self.w2_imag)\n",
-        "        o_r = o_r + self.b2_real\n",
-        "        o_i = o_i + self.b2_imag\n",
-        "\n",
-        "        o_r = tf.reshape(o_r, [B, Hf, Wf, self.num_blocks, self.block_size])\n",
-        "        o_i = tf.reshape(o_i, [B, Hf, Wf, self.num_blocks, self.block_size])\n",
-        "        out_ft = tf.complex(o_r, o_i)\n",
-        "\n",
-        "        out_ft_p = tf.transpose(out_ft, [0, 3, 4, 1, 2])\n",
-        "        x_out = tf.signal.irfft2d(out_ft_p, fft_length=[H, W])\n",
-        "        x_out = tf.transpose(x_out, [0, 3, 4, 1, 2])\n",
-        "        return tf.reshape(x_out, [B, H, W, self.embed_dim])\n",
-        "\n",
-        "    def get_config(self):\n",
-        "        config = super().get_config()\n",
-        "        config.update({\n",
-        "            \"embed_dim\": self.embed_dim,\n",
-        "            \"num_blocks\": self.num_blocks,\n",
-        "            \"sparsity_threshold\": self.sparsity_threshold,\n",
-        "        })\n",
-        "        return config\n",
-        "\n",
-        "\n",
-        "class AFNOResBlock(layers.Layer):\n",
-        "    \"\"\"Hybrid Residual Block combining AFNO spectral mixing, FiLM conditioning, and Conv2D refinement.\"\"\"\n",
-        "    def __init__(self, channels: int, num_blocks: int = 8, mlp_ratio: float = 2.0, **kwargs):\n",
-        "        super().__init__(**kwargs)\n",
-        "        self.channels = int(channels)\n",
-        "        self.norm1 = layers.LayerNormalization(epsilon=1e-5)\n",
-        "        self.afno = AFNO2D(channels, num_blocks=num_blocks)\n",
-        "        self.film = FiLMLayer(channels)\n",
-        "        self.norm2 = layers.LayerNormalization(epsilon=1e-5)\n",
-        "        hidden = int(channels * mlp_ratio)\n",
-        "        self.conv1 = layers.Conv2D(hidden, 3, padding=\"same\", activation=\"gelu\")\n",
-        "        self.conv2 = layers.Conv2D(channels, 3, padding=\"same\")\n",
-        "\n",
-        "    def call(self, x, condition=None):\n",
-        "        h = self.afno(self.norm1(x))\n",
-        "        x = x + h\n",
-        "        if condition is not None:\n",
-        "            x = self.film(x, condition)\n",
-        "        h = self.conv2(self.conv1(self.norm2(x)))\n",
-        "        return x + 0.2 * h\n",
-        "\n",
-        "    def get_config(self):\n",
-        "        config = super().get_config()\n",
-        "        config.update({\"channels\": self.channels})\n",
-        "        return config\n",
-        "\n",
-        "\n",
-        "class ProgressiveUpsampleBlock(layers.Layer):\n",
-        "    \"\"\"Artifact-free progressive 2x upsampling with convolutional refinement and FiLM.\"\"\"\n",
-        "    def __init__(self, in_channels: int, out_channels: int, **kwargs):\n",
-        "        super().__init__(**kwargs)\n",
-        "        self.in_channels = int(in_channels)\n",
-        "        self.out_channels = int(out_channels)\n",
-        "        self.upsample = layers.UpSampling2D(size=2, interpolation=\"bilinear\")\n",
-        "        self.conv_in = layers.Conv2D(out_channels, 3, padding=\"same\", activation=\"gelu\")\n",
-        "        self.film = FiLMLayer(out_channels)\n",
-        "        self.conv_refine = layers.Conv2D(out_channels, 3, padding=\"same\", activation=\"gelu\")\n",
-        "        self.conv_out = layers.Conv2D(out_channels, 3, padding=\"same\")\n",
-        "\n",
-        "    def call(self, x, condition=None):\n",
-        "        h = self.upsample(x)\n",
-        "        h = self.conv_in(h)\n",
-        "        if condition is not None:\n",
-        "            h = self.film(h, condition)\n",
-        "        res = self.conv_out(self.conv_refine(h))\n",
-        "        return h + 0.2 * res\n",
-        "\n",
-        "    def get_config(self):\n",
-        "        config = super().get_config()\n",
-        "        config.update({\n",
-        "            \"in_channels\": self.in_channels,\n",
-        "            \"out_channels\": self.out_channels,\n",
-        "        })\n",
-        "        return config\n"
-    ]
-})
 
-# Cell 4: Code - Baseline vs Revised Model Definitions
-cells.append({
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": [
-        "# =============================================================================\n",
-        "# MODEL BUILDERS: Baseline SRDCNN_SST_v3 vs Revised SRDN_ResAFNO_v4\n",
-        "# =============================================================================\n",
-        "\n",
-        "def SRDCNN_SST_v3(numHiddenUnits=64, numResponses=1, numFeatures=1, numLats=512, numLongs=512, shrink=8):\n",
-        "    \"\"\"Current Baseline Model from Jupyter_SRDCNN_stand.20260901.ipynb (~404K params).\"\"\"\n",
-        "    reg_val = 1e-9\n",
-        "    in_h = int(numLats / shrink)\n",
-        "    in_w = int(numLongs / shrink)\n",
-        "    inputs = layers.Input(shape=(in_h, in_w, numFeatures), name=\"input_coarse_sst\")\n",
-        "\n",
-        "    x = layers.Conv2DTranspose(\n",
-        "        numHiddenUnits, (7, 7), strides=2, activation=\"relu\", padding=\"same\",\n",
-        "        kernel_regularizer=l2(reg_val), activity_regularizer=l2(reg_val), bias_regularizer=l2(reg_val),\n",
-        "        name=\"conv2d_transpose_1\"\n",
-        "    )(inputs)\n",
-        "    x = layers.Conv2DTranspose(\n",
-        "        numHiddenUnits, (7, 7), strides=2, activation=\"relu\", padding=\"same\",\n",
-        "        kernel_regularizer=l2(reg_val), activity_regularizer=l2(reg_val), bias_regularizer=l2(reg_val),\n",
-        "        name=\"conv2d_transpose_2\"\n",
-        "    )(x)\n",
-        "    x = layers.Conv2DTranspose(\n",
-        "        numHiddenUnits, (7, 7), strides=2, activation=\"relu\", padding=\"same\",\n",
-        "        kernel_regularizer=l2(reg_val), activity_regularizer=l2(reg_val), bias_regularizer=l2(reg_val),\n",
-        "        name=\"conv2d_transpose_3\"\n",
-        "    )(x)\n",
-        "\n",
-        "    outputs = layers.Conv2D(\n",
-        "        numResponses, (1, 1), activation=\"linear\", padding=\"same\",\n",
-        "        kernel_regularizer=l2(reg_val), activity_regularizer=l2(reg_val), bias_regularizer=l2(reg_val),\n",
-        "        name=\"conv2d_output\"\n",
-        "    )(x)\n",
-        "\n",
-        "    model = models.Model(inputs=inputs, outputs=outputs, name=\"SRDCNN_SST_v3_Baseline\")\n",
-        "    return model\n",
-        "\n",
-        "\n",
-        "def SRDN_ResAFNO_v4(numHiddenUnits=128, numResponses=1, numFeatures=1, numLats=512, numLongs=512,\n",
-        "                    shrink=8, trunk_blocks=6, num_freq_blocks=8):\n",
-        "    \"\"\"Revised Deterministic Model with ResAFNO trunk, FiLM, and Progressive Upsampling (~4.75M params).\"\"\"\n",
-        "    in_h = int(numLats / shrink)\n",
-        "    in_w = int(numLongs / shrink)\n",
-        "    inputs = layers.Input(shape=(in_h, in_w, numFeatures), name=\"input_coarse_sst\")\n",
-        "\n",
-        "    # 1. Global physical coarse SST skip (bilinear interpolation to native grid)\n",
-        "    coarse_skip = layers.UpSampling2D(size=shrink, interpolation=\"bilinear\", name=\"physical_coarse_skip\")(inputs)\n",
-        "\n",
-        "    # 2. Large-scale conditioning encoder for FiLM\n",
-        "    cond_pool = layers.GlobalAveragePooling2D(name=\"cond_gap\")(inputs)\n",
-        "    cond_emb = layers.Dense(numHiddenUnits, activation=\"gelu\", name=\"cond_mlp_1\")(cond_pool)\n",
-        "    cond_emb = layers.Dense(numHiddenUnits, activation=\"gelu\", name=\"cond_mlp_2\")(cond_emb)\n",
-        "\n",
-        "    # 3. Stem convolution\n",
-        "    x = layers.Conv2D(numHiddenUnits, 3, padding=\"same\", activation=\"gelu\", name=\"stem_conv\")(inputs)\n",
-        "\n",
-        "    # 4. Deep Hybrid ResAFNO Trunk (at 64x64 resolution)\n",
-        "    for i in range(trunk_blocks):\n",
-        "        x = AFNOResBlock(\n",
-        "            channels=numHiddenUnits,\n",
-        "            num_blocks=num_freq_blocks,\n",
-        "            mlp_ratio=2.0,\n",
-        "            name=f\"res_afno_block_{i+1}\"\n",
-        "        )(x, condition=cond_emb)\n",
-        "\n",
-        "    # 5. Progressive 3-Stage 2x Upsampling: 64 -> 128 -> 256 -> 512\n",
-        "    x = ProgressiveUpsampleBlock(in_channels=numHiddenUnits, out_channels=128, name=\"upsample_stage1_128\")(x, condition=cond_emb)\n",
-        "    x = ProgressiveUpsampleBlock(in_channels=128, out_channels=96, name=\"upsample_stage2_256\")(x, condition=cond_emb)\n",
-        "    x = ProgressiveUpsampleBlock(in_channels=96, out_channels=64, name=\"upsample_stage3_512\")(x, condition=cond_emb)\n",
-        "\n",
-        "    # 6. High-Resolution Reconstruction Head\n",
-        "    x = layers.Conv2D(32, 3, padding=\"same\", activation=\"gelu\", name=\"head_conv1\")(x)\n",
-        "    residual_detail = layers.Conv2D(\n",
-        "        numResponses, 3, padding=\"same\",\n",
-        "        kernel_initializer=\"zeros\",\n",
-        "        bias_initializer=\"zeros\",\n",
-        "        name=\"head_conv_detail\"\n",
-        "    )(x)\n",
-        "\n",
-        "    # 7. Final synthesis: detail residual + physical coarse skip\n",
-        "    outputs = layers.Add(name=\"final_sst_output\")([residual_detail, coarse_skip])\n",
-        "\n",
-        "    model = models.Model(inputs=inputs, outputs=outputs, name=\"SRDN_ResAFNO_v4_Deterministic\")\n",
-        "    return model\n"
-    ]
-})
+def code(source):
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": source.splitlines(True),
+    }
 
-# Cell 5: Code - Model Summaries & Comparison
-cells.append({
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": [
-        "print(\"=\" * 80)\n",
-        "print(\"CURRENT BASELINE MODEL SUMMARY:\")\n",
-        "print(\"=\" * 80)\n",
-        "baseline_model = SRDCNN_SST_v3()\n",
-        "baseline_model.summary()\n",
-        "\n",
-        "print(\"\\n\" + \"=\" * 80)\n",
-        "print(\"REVISED RES-AFNO DETERMINISTIC MODEL SUMMARY:\")\n",
-        "print(\"=\" * 80)\n",
-        "revised_model = SRDN_ResAFNO_v4()\n",
-        "revised_model.summary()\n",
-        "\n",
-        "b_p = baseline_model.count_params()\n",
-        "r_p = revised_model.count_params()\n",
-        "print(\"\\n\" + \"=\" * 80)\n",
-        "print(f\"COMPLEXITY COMPARISON:\")\n",
-        "print(f\"  - Baseline Model Params : {b_p:>10,d}  (~{b_p/1e6:.2f}M)\")\n",
-        "print(f\"  - Revised Model Params  : {r_p:>10,d}  (~{r_p/1e6:.2f}M)\")\n",
-        "print(f\"  - Capacity Increase     : {r_p / b_p:>10.2f}x\")\n",
-        "print(\"=\" * 80)\n"
-    ]
-})
 
-# Cell 6: Code - CPU Dummy Data Testing
-cells.append({
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": [
-        "# =============================================================================\n",
-        "# CPU VERIFICATION WITH DUMMY DATA (Single Step / 1-Epoch Fit)\n",
-        "# =============================================================================\n",
-        "print(\"Running deterministic CPU verification with synthetic SST batches...\")\n",
-        "\n",
-        "np.random.seed(42)\n",
-        "batch_size = 4\n",
-        "num_lats, num_longs, shrink = 512, 512, 8\n",
-        "\n",
-        "# Create synthetic low-res inputs (64x64) and high-res targets (512x512)\n",
-        "x_dummy = np.random.randn(batch_size, num_lats // shrink, num_longs // shrink, 1).astype(np.float32)\n",
-        "y_dummy = np.random.randn(batch_size, num_lats, num_longs, 1).astype(np.float32)\n",
-        "\n",
-        "# 1. Test Baseline Model\n",
-        "opt_base = tf.keras.optimizers.Adam(learning_rate=0.001)\n",
-        "baseline_model.compile(optimizer=opt_base, loss='mse', metrics=['mae'])\n",
-        "loss_base = baseline_model.train_on_batch(x_dummy, y_dummy)\n",
-        "print(f\"[Baseline Model] Dummy Train Step Loss: {loss_base}\")\n",
-        "\n",
-        "# 2. Test Revised ResAFNO Model\n",
-        "opt_rev = tf.keras.optimizers.Adam(learning_rate=0.001)\n",
-        "revised_model.compile(optimizer=opt_rev, loss='mse', metrics=['mae'])\n",
-        "loss_rev = revised_model.train_on_batch(x_dummy, y_dummy)\n",
-        "print(f\"[Revised Model]  Dummy Train Step Loss: {loss_rev}\")\n",
-        "\n",
-        "# 3. Verification inference shape\n",
-        "y_pred = revised_model(x_dummy, training=False)\n",
-        "print(f\"[Revised Model]  Input shape : {x_dummy.shape}\")\n",
-        "print(f\"[Revised Model]  Output shape: {y_pred.shape}\")\n",
-        "assert y_pred.shape == (batch_size, num_lats, num_longs, 1), \"Shape mismatch!\"\n",
-        "print(\"\\nSUCCESS: CPU Smoke tests and gradient backpropagation verified!\")\n"
-    ]
-})
+cells = [
+    markdown(
+        """# SRDN ResAFNO: mask-aware 16x validation
 
-# Cell 7: Markdown - Cluster & Horovod Integration
-cells.append({
-    "cell_type": "markdown",
-    "metadata": {},
-    "source": [
-        "## Multi-Node Cluster Execution (Horovod)\n",
-        "When running on multi-GPU cluster nodes (e.g. NCI Gadi with NVIDIA H200/V100 GPUs), wrap training in the Horovod runner below."
-    ]
-})
+This notebook is a thin executable front end to the canonical implementation in
+`model_srdn_advanced.py`.  The OFAM experiment is **32x32 -> 512x512 (16x)**.
+Both models receive named `coarse_sst`, `coarse_mask`, and `fine_mask` inputs,
+use the training-only normalization, return `(B, 512, 512, 1)`, emit exact
+zero on land, and enforce valid 16x16 coarse consistency.
 
-# Cell 8: Code - Horovod Cluster Training Function
-cells.append({
-    "cell_type": "code",
-    "execution_count": None,
-    "metadata": {},
-    "outputs": [],
-    "source": [
-        "def train_horovod_cluster():\n",
-        "    \"\"\"Distributed multi-node training loop using Horovod and the revised ResAFNO architecture.\"\"\"\n",
-        "    if not hvd_available:\n",
-        "        print(\"Horovod is not installed in this standalone environment. Skipping cluster call.\")\n",
-        "        return\n",
-        "\n",
-        "    hvd.init()\n",
-        "    gpus = tf.config.experimental.list_physical_devices('GPU')\n",
-        "    for gpu in gpus:\n",
-        "        tf.config.experimental.set_memory_growth(gpu, True)\n",
-        "    if gpus:\n",
-        "        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')\n",
-        "\n",
-        "    model = SRDN_ResAFNO_v4()\n",
-        "    opt = tf.optimizers.Adam(learning_rate=0.001 * hvd.size())\n",
-        "    opt = hvd.DistributedOptimizer(opt)\n",
-        "    model.compile(loss='mse', optimizer=opt, metrics=['mae'])\n",
-        "\n",
-        "    callbacks = [\n",
-        "        hvd.callbacks.BroadcastGlobalVariablesCallback(0),\n",
-        "        hvd.callbacks.MetricAverageCallback(),\n",
-        "    ]\n",
-        "    if hvd.rank() == 0:\n",
-        "        callbacks.append(tf.keras.callbacks.ModelCheckpoint('./checkpoints_resafno/ckpt-{epoch}.h5', save_best_only=True))\n",
-        "\n",
-        "    print(f\"Horovod rank {hvd.rank()}/{hvd.size()} initialized successfully.\")\n",
-        "\n",
-        "# To launch on cluster via mpirun:\n",
-        "# from horovod import run\n",
-        "# run(train_horovod_cluster, np=4)\n"
-    ]
-})
+The notebook intentionally does not duplicate model definitions.  That avoids
+the old notebook/script divergence in which the notebook retained an 8x input,
+three upsampling stages, no mask inputs, and an invalid 100%-impulse AFNO test.
+"""
+    ),
+    code(
+        """from pathlib import Path
+import sys
+import numpy as np
+import tensorflow as tf
+
+HERE = Path.cwd()
+if HERE.name != "SRDN":
+    HERE = HERE / "SRDN" if (HERE / "SRDN").exists() else HERE
+sys.path.insert(0, str(HERE))
+
+from model_srdn_advanced import (
+    AFNO2D,
+    CoarseConsistencyProjection,
+    SRDCNN_SST_v3,
+    SRDN_ResAFNO_v4,
+)
+
+print("TensorFlow:", tf.__version__)
+print("Python:", sys.executable)
+print("GPUs:", tf.config.list_physical_devices("GPU"))
+"""
+    ),
+    markdown(
+        """## Model contract and parameter counts
+
+The conventional baseline keeps the transpose-convolution decoder; it has four
+2x blocks because this real dataset is 16x.  ResAFNO has four progressive 2x
+blocks after its 32x32 spectral trunk.  Parameter-count differences are
+reported explicitly and are not evidence that AFNO itself is responsible for
+any skill difference.
+"""
+    ),
+    code(
+        """baseline = SRDCNN_SST_v3(numHiddenUnits=64, shrink=16)
+resafno = SRDN_ResAFNO_v4(numHiddenUnits=128, shrink=16)
+print("baseline params:", baseline.count_params())
+print("ResAFNO params:", resafno.count_params())
+print("baseline input shapes:", [tuple(value.shape) for value in baseline.inputs])
+print("ResAFNO input shapes:", [tuple(value.shape) for value in resafno.inputs])
+print("outputs:", baseline.output_shape, resafno.output_shape)
+"""
+    ),
+    markdown(
+        """## AFNO property checks
+
+AFNO is a global Fourier operation, but a single impulse need not activate
+every output pixel.  The meaningful checks are a distant perturbation,
+periodic translation equivariance, and finite gradients.
+"""
+    ),
+    code(
+        """tf.random.set_seed(42)
+afno = AFNO2D(embed_dim=32, num_blocks=4, sparsity_threshold=0.01)
+base = tf.random.normal([1, 64, 64, 32])
+changed = base.numpy().copy()
+changed[0, 4, 7, :] += 1.0
+changed = tf.constant(changed)
+distant_response = float(tf.abs(afno(changed) - afno(base))[0, 32, 32, 0])
+shift = [7, 13]
+equivariance_error = float(tf.reduce_max(tf.abs(
+    afno(tf.roll(base, shift=shift, axis=[1, 2])) -
+    tf.roll(afno(base), shift=shift, axis=[1, 2])
+)))
+print("distant response:", distant_response)
+print("translation-equivariance max error:", equivariance_error)
+assert distant_response > 1e-8
+assert equivariance_error < 1e-4
+"""
+    ),
+    markdown(
+        """## Real OFAM mask/data smoke test
+
+This reads two dates from the immutable source file, validates the derived
+mask fingerprint and date axis, checks packed-value decoding, then runs both
+models on the actual named-input batch.
+"""
+    ),
+    code(
+        """from srdn_data import DerivedProduct, SRDNData
+
+PROJECT = HERE.parent if HERE.name == "SRDN" else HERE
+source = PROJECT / "sst_10km_OFAM_historical_Australia.nc"
+derived_path = PROJECT / "derived" / "sst_downscaling_f16.nc"
+normalization = PROJECT / "reports" / "normalization_f16.json"
+derived = DerivedProduct(derived_path)
+data = SRDNData(source, derived, normalization, [["2011-01-01", "2011-01-02"]])
+inputs, target = data.batch([0, 1])
+print({key: value.shape for key, value in inputs.items()}, target.shape)
+assert np.isfinite(target).all()
+assert np.all(target[inputs["fine_mask"] == 0] == 0)
+for model in (baseline, resafno):
+    output = model(inputs, training=False)
+    assert output.shape == (2, 512, 512, 1)
+    assert np.isfinite(output.numpy()).all()
+    assert np.all(output.numpy()[inputs["fine_mask"] == 0] == 0)
+    print(model.name, "forward passed")
+data.close()
+"""
+    ),
+    markdown(
+        """## Reproducible training/evaluation entry points
+
+For a short CPU run, use `train_srdn.py` with one of the JSON configurations;
+the evaluator streams the full 2011--2014 test period and applies the paired
+per-day bootstrap decision rule.  The H200 workflow is in
+`jobs/srdn_gpu_smoke.pbs`, `jobs/srdn_train_pilot.pbs`, and
+`jobs/srdn_evaluate.pbs`.
+"""
+    ),
+]
 
 notebook = {
     "cells": cells,
     "metadata": {
-        "kernelspec": {
-            "display_name": "Python 3 (venv_srdn)",
-            "language": "python",
-            "name": "python3"
-        },
-        "language_info": {
-            "codemirror_mode": {
-                "name": "ipython",
-                "version": 3
-            },
-            "file_extension": ".py",
-            "mimetype": "text/x-python",
-            "name": "python",
-            "nbconvert_exporter": "python",
-            "pygments_lexer": "ipython3",
-            "version": "3.9.18"
-        }
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3.9"},
     },
     "nbformat": 4,
-    "nbformat_minor": 5
+    "nbformat_minor": 5,
 }
-
-with open(notebook_path, "w") as f:
-    json.dump(notebook, f, indent=2)
-
-print(f"Generated notebook at: {notebook_path}")
+NOTEBOOK_PATH.write_text(json.dumps(notebook, indent=1) + "\n")
+print(f"wrote {NOTEBOOK_PATH}")

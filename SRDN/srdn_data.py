@@ -74,10 +74,7 @@ class DerivedProduct:
             self.coarsen_factor = int(getattr(dataset, "coarsen_factor", 16))
         if self.sst_lr.shape[0] != len(self.dates):
             raise ValueError("derived time and sst_lr dimensions disagree")
-        if self.ocean_mask.shape != tuple(self.sst_lr.shape[1:])[:0] + (
-            len(self.lat),
-            len(self.lon),
-        ):
+        if self.ocean_mask.shape != (len(self.lat), len(self.lon)):
             raise ValueError("derived high-resolution mask shape is inconsistent")
         if self.source_mask_sha256:
             actual = _mask_sha256(self.ocean_mask, self.lat, self.lon)
@@ -141,6 +138,13 @@ class SRDNData:
                 raise KeyError(f"source has no {SOURCE_VARIABLE!r} variable")
             self._target_variable = self._source.variables[SOURCE_VARIABLE]
             shape = self._target_variable.shape
+            if "Time" not in self._source.variables:
+                raise KeyError("source has no 'Time' coordinate")
+            source_dates = _read_dates(self._source, "Time")
+            if not np.array_equal(source_dates, self.derived.dates):
+                raise ValueError("source and derived products have different dates")
+            if shape[0] != len(self.derived.dates):
+                raise ValueError("source target and derived time dimensions disagree")
             if tuple(shape[-2:]) != self.ocean_mask.shape:
                 raise ValueError(
                     f"source target shape {shape[-2:]} != mask shape "

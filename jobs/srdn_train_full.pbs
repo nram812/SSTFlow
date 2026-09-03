@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -N srdn-full
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit from the SSTDownscaling root}"
+PYBIN="${PYBIN:-$PWD/SRDN/venv_srdn_gpu/bin/python}"
+MODEL="${MODEL:-resafno}"
+if [[ "$MODEL" == "resafno" ]]; then CONFIG="configs/srdn_resafno.json"; else CONFIG="configs/srdn_srdcnn.json"; fi
+if [[ ! -x "$PYBIN" ]]; then echo "Missing GPU Python: $PYBIN" >&2; exit 2; fi
+export PYTHONPATH="$PWD/SRDN"
+"$PYBIN" -u SRDN/train_srdn.py --config "$CONFIG" --device cuda
+status=$("$PYBIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
+  "runs/srdn_${MODEL}_mask_aware_f16/status.json")
+if [[ "$status" == "checkpointed" ]]; then qsub -v MODEL="$MODEL",PYBIN="$PYBIN" jobs/srdn_train_full.pbs; fi

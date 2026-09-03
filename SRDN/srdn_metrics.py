@@ -66,6 +66,7 @@ def daily_spatial_correlation(prediction, target, mask):
         mask = np.broadcast_to(mask[None], prediction.shape)
     correlations = []
     for pred, truth, valid in zip(prediction, target, mask):
+        valid = np.array(valid, dtype=bool, copy=True)
         valid &= np.isfinite(pred) & np.isfinite(truth)
         x, y = pred[valid], truth[valid]
         x = x - x.mean()
@@ -99,6 +100,45 @@ def spectral_log_power_error(prediction, target, mask):
             np.log1p(pred_power) - np.log1p(target_power)
         ))))
     return float(np.mean(errors))
+
+
+def coarse_block_differences(values, coarse, coarse_mask, fine_mask, shrink):
+    """Return fine valid-block mean minus coarse values for valid blocks."""
+    values = np.asarray(values, dtype=np.float64)
+    coarse = np.asarray(coarse, dtype=np.float64)
+    coarse_mask = np.asarray(coarse_mask, dtype=bool)
+    fine_mask = np.asarray(fine_mask, dtype=bool)
+    if values.ndim == 2:
+        values = values[None]
+        fine_mask = fine_mask[None]
+    if coarse.ndim == 2:
+        coarse = coarse[None]
+        coarse_mask = coarse_mask[None]
+    batch, height, width = values.shape
+    if height % shrink or width % shrink:
+        raise ValueError("fine dimensions must be divisible by shrink")
+    coarse_height, coarse_width = height // shrink, width // shrink
+    masks = fine_mask.reshape(batch, coarse_height, shrink, coarse_width, shrink)
+    # Avoid NaN*0 propagation when callers represent land as NaN.
+    values = np.where(fine_mask, values, 0.0)
+    blocks = values.reshape(batch, coarse_height, shrink, coarse_width, shrink)
+    counts = masks.sum(axis=(2, 4))
+    means = (blocks * masks).sum(axis=(2, 4)) / np.maximum(counts, 1.0)
+    valid = coarse_mask & (counts > 0) & np.isfinite(means) & np.isfinite(coarse)
+    return (means - coarse)[valid]
+
+
+def coarse_consistency_error(values, coarse, coarse_mask, fine_mask, shrink):
+    differences = coarse_block_differences(
+        values, coarse, coarse_mask, fine_mask, shrink
+    )
+    if not len(differences):
+        return {"mae_c": float("nan"), "rmse_c": float("nan"), "max_abs_c": float("nan")}
+    return {
+        "mae_c": float(np.mean(np.abs(differences))),
+        "rmse_c": float(np.sqrt(np.mean(np.square(differences)))),
+        "max_abs_c": float(np.max(np.abs(differences))),
+    }
 
 
 def coast_distance_masks(ocean_mask: np.ndarray):

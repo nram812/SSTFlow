@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 import netCDF4
@@ -14,10 +15,10 @@ from model_srdn_advanced import CoarseConsistencyProjection
 from srdn_data import DerivedProduct, SRDNData
 from srdn_metrics import (
     coast_distance_masks,
+    coarse_block_differences,
     daily_mse,
     daily_spatial_correlation,
     denormalize,
-    masked_field_metrics,
     paired_bootstrap_delta,
     spectral_log_power_error,
     write_json,
@@ -113,7 +114,7 @@ def save_samples(path, dates, prediction, target, bilinear, coarse, derived):
         time_var.units = "days since 1979-01-01 00:00:00"
         time_var.calendar = "proleptic_gregorian"
         time_var[:] = netCDF4.date2num(
-            [netCDF4.datetime.strptime(date, "%Y-%m-%d") for date in dates],
+            [datetime.strptime(date, "%Y-%m-%d") for date in dates],
             time_var.units,
             calendar=time_var.calendar,
         )
@@ -150,6 +151,11 @@ def evaluate(config, run_dir: Path, batch_size=2, max_days=None):
     sample_set = set(int(value) for value in sample_positions)
     sample_prediction = {}; sample_target = {}; sample_bilinear = {}; sample_coarse = {}; sample_dates = {}
     spectral_predictions, spectral_targets = [], []
+    consistency_model, consistency_bilinear = [], []
+    land_leakage_model_max = 0.0
+    land_leakage_bilinear_max = 0.0
+    land_leakage_model_pixels = 0
+    land_leakage_bilinear_pixels = 0
 
     for start in range(0, len(positions), int(batch_size)):
         current = positions[start : start + int(batch_size)]
@@ -157,6 +163,21 @@ def evaluate(config, run_dir: Path, batch_size=2, max_days=None):
         prediction_normalized = model(inputs, training=False).numpy()
         bilinear_normalized = bilinear_prediction(inputs, derived, consistent=True)
         mask = inputs["fine_mask"][..., 0].astype(bool)
+        land = ~mask
+        land_leakage_model_max = max(
+            land_leakage_model_max,
+            float(np.max(np.abs(prediction_normalized[..., 0][land]))) * data.std,
+        )
+        land_leakage_bilinear_max = max(
+            land_leakage_bilinear_max,
+            float(np.max(np.abs(bilinear_normalized[..., 0][land]))) * data.std,
+        )
+        land_leakage_model_pixels += int(
+            np.count_nonzero(np.abs(prediction_normalized[..., 0][land]) > 1.0e-7)
+        )
+        land_leakage_bilinear_pixels += int(
+            np.count_nonzero(np.abs(bilinear_normalized[..., 0][land]) > 1.0e-7)
+        )
         prediction = denormalize(prediction_normalized[..., 0], data.mean, data.std)
         target = denormalize(target_normalized[..., 0], data.mean, data.std)
         bilinear = denormalize(bilinear_normalized[..., 0], data.mean, data.std)
@@ -168,6 +189,27 @@ def evaluate(config, run_dir: Path, batch_size=2, max_days=None):
         daily_model.extend(daily_mse(prediction, target, derived.ocean_mask))
         daily_bilinear.extend(daily_mse(bilinear, target, derived.ocean_mask))
         daily_corr.extend(daily_spatial_correlation(prediction, target, derived.ocean_mask))
+        coarse_physical = denormalize(
+            inputs["coarse_sst"][..., 0], data.mean, data.std
+        )
+        consistency_model.extend(
+            coarse_block_differences(
+                prediction,
+                coarse_physical,
+                inputs["coarse_mask"][..., 0],
+                mask,
+                derived.coarsen_factor,
+            )
+        )
+        consistency_bilinear.extend(
+            coarse_block_differences(
+                bilinear,
+                coarse_physical,
+                inputs["coarse_mask"][..., 0],
+                mask,
+                derived.coarsen_factor,
+            )
+        )
         for name, band in coast_masks.items():
             _accumulate(regional[name], prediction, target, band)
         if len(spectral_predictions) < 8:
@@ -195,6 +237,22 @@ def evaluate(config, run_dir: Path, batch_size=2, max_days=None):
         np.asarray(spectral_predictions), np.asarray(spectral_targets), derived.ocean_mask
     )
     metrics["regions"] = {name: _finish(value) for name, value in regional.items()}
+    model_consistency = np.asarray(consistency_model, dtype=np.float64)
+    bilinear_consistency = np.asarray(consistency_bilinear, dtype=np.float64)
+    metrics["coarse_consistency"] = {
+        "mae_c": float(np.mean(np.abs(model_consistency))),
+        "rmse_c": float(np.sqrt(np.mean(np.square(model_consistency)))),
+        "max_abs_c": float(np.max(np.abs(model_consistency))),
+        "bilinear_mae_c": float(np.mean(np.abs(bilinear_consistency))),
+        "bilinear_rmse_c": float(np.sqrt(np.mean(np.square(bilinear_consistency)))),
+        "bilinear_max_abs_c": float(np.max(np.abs(bilinear_consistency))),
+    }
+    metrics["land_leakage"] = {
+        "model_max_abs_c": land_leakage_model_max,
+        "model_pixels_above_1e-7_normalized": land_leakage_model_pixels,
+        "bilinear_max_abs_c": land_leakage_bilinear_max,
+        "bilinear_pixels_above_1e-7_normalized": land_leakage_bilinear_pixels,
+    }
     metrics["bilinear_reference"] = bilinear_metrics
     metrics["checkpoint"] = checkpoint
     metrics["days"] = int(len(positions))

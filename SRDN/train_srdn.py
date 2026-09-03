@@ -126,14 +126,23 @@ def save_checkpoint(manager, run_dir: Path, model, optimizer, step):
     return checkpoint_path
 
 
-def train(config: dict, smoke_steps: int | None = None, device_name: str | None = None):
+def train(
+    config: dict,
+    smoke_steps: int | None = None,
+    device_name: str | None = None,
+    max_steps_override: int | None = None,
+    output_dir_override: str | Path | None = None,
+):
     device = configure_device(device_name or config.get("device", "cpu"))
     seed = int(config.get("seed", 42))
     np.random.seed(seed)
     tf.random.set_seed(seed)
-    run_dir = Path(
-        config["smoke_output_dir"] if smoke_steps is not None else config["output_dir"]
-    )
+    if output_dir_override is not None:
+        run_dir = Path(output_dir_override)
+    else:
+        run_dir = Path(
+            config["smoke_output_dir"] if smoke_steps is not None else config["output_dir"]
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
     write_json(run_dir / "config_used.json", config)
     write_json(run_dir / "status.json", {"status": "running", "step": 0})
@@ -170,7 +179,13 @@ def train(config: dict, smoke_steps: int | None = None, device_name: str | None 
             print(f"[resume] {manager.latest_checkpoint}", flush=True)
 
     step = int(step_variable.numpy())
-    max_steps = int(smoke_steps if smoke_steps is not None else config["max_steps"])
+    max_steps = int(
+        smoke_steps
+        if smoke_steps is not None
+        else max_steps_override
+        if max_steps_override is not None
+        else config["max_steps"]
+    )
     history = []
     validation_positions = validation_data.random_positions(
         int(config.get("validation_samples", 8)), seed=seed + 100
@@ -251,8 +266,16 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
     parser.add_argument("--smoke-steps", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
-    train(load_config(args.config), args.smoke_steps, args.device)
+    train(
+        load_config(args.config),
+        args.smoke_steps,
+        args.device,
+        args.max_steps,
+        args.output_dir,
+    )
 
 
 if __name__ == "__main__":

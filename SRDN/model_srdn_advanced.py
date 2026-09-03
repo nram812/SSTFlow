@@ -56,10 +56,14 @@ class MaskedOutput(layers.Layer):
 
     def call(self, inputs):
         values, mask = inputs
-        return values * tf.cast(mask, values.dtype)
+        output = values * tf.cast(mask, values.dtype)
+        return tf.ensure_shape(output, values.shape)
 
     def get_config(self):
         return super().get_config()
+
+    def compute_output_shape(self, input_shape):
+        return tf.TensorShape(input_shape[0])
 
 
 class CoarseConsistencyProjection(layers.Layer):
@@ -108,12 +112,16 @@ class CoarseConsistencyProjection(layers.Layer):
         correction = tf.repeat(
             tf.repeat(correction, self.shrink, axis=1), self.shrink, axis=2
         )
-        return (values + correction * fine_mask) * fine_mask
+        output = (values + correction * fine_mask) * fine_mask
+        return tf.ensure_shape(output, values.shape)
 
     def get_config(self):
         config = super().get_config()
         config.update({"shrink": self.shrink})
         return config
+
+    def compute_output_shape(self, input_shape):
+        return tf.TensorShape(input_shape[0])
 
 
 class AFNO2D(layers.Layer):
@@ -183,6 +191,23 @@ class AFNO2D(layers.Layer):
     def _softshrink(self, value, lambd):
         return tf.sign(value) * tf.maximum(tf.abs(value) - lambd, 0.0)
 
+    def _complex_softshrink(self, real, imag, lambd):
+        """Phase-equivariant shrinkage of a complex Fourier coefficient."""
+        magnitude = tf.sqrt(tf.square(real) + tf.square(imag))
+        scale = tf.maximum(magnitude - lambd, 0.0) / tf.maximum(
+            magnitude, tf.cast(1.0e-8, magnitude.dtype)
+        )
+        return real * scale, imag * scale
+
+    def _zero_mode_bias(self, bias, batch, frequency_count):
+        """Add a bias only to k=(0,0), preserving translation equivariance."""
+        zero = tf.broadcast_to(bias, [batch, 1, self.num_blocks, self.block_size])
+        remainder = tf.zeros(
+            [batch, frequency_count - 1, self.num_blocks, self.block_size],
+            dtype=zero.dtype,
+        )
+        return tf.concat([zero, remainder], axis=1)
+
     def call(self, x):
         shape = tf.shape(x)
         batch, height, width = shape[0], shape[1], shape[2]
@@ -207,11 +232,14 @@ class AFNO2D(layers.Layer):
         )
 
         real, imag = self._complex_mul(real, imag, self.w1_real, self.w1_imag)
-        real = self._softshrink(real + self.b1_real, self.sparsity_threshold)
-        imag = self._softshrink(imag + self.b1_imag, self.sparsity_threshold)
+        real = real + self._zero_mode_bias(self.b1_real, batch, height_f * width_f)
+        imag = imag + self._zero_mode_bias(self.b1_imag, batch, height_f * width_f)
+        real, imag = self._complex_softshrink(
+            real, imag, self.sparsity_threshold
+        )
         real, imag = self._complex_mul(real, imag, self.w2_real, self.w2_imag)
-        real = real + self.b2_real
-        imag = imag + self.b2_imag
+        real = real + self._zero_mode_bias(self.b2_real, batch, height_f * width_f)
+        imag = imag + self._zero_mode_bias(self.b2_imag, batch, height_f * width_f)
 
         real = tf.reshape(
             real, [batch, height_f, width_f, self.num_blocks, self.block_size]
@@ -225,7 +253,8 @@ class AFNO2D(layers.Layer):
         ) * norm_scale
         output = tf.signal.irfft2d(output_spectrum, fft_length=[height, width])
         output = tf.transpose(output, [0, 3, 4, 1, 2])
-        return tf.reshape(output, [batch, height, width, self.embed_dim])
+        output = tf.reshape(output, [batch, height, width, self.embed_dim])
+        return tf.ensure_shape(output, [None, None, None, self.embed_dim])
 
     def get_config(self):
         config = super().get_config()
@@ -237,6 +266,10 @@ class AFNO2D(layers.Layer):
             }
         )
         return config
+
+    def compute_output_shape(self, input_shape):
+        input_shape = tf.TensorShape(input_shape)
+        return input_shape[:-1].concatenate(self.embed_dim)
 
 
 class AFNOResBlock(layers.Layer):
@@ -406,6 +439,17 @@ def SRDCNN_SST_v3(
         bias_regularizer=l2(reg_val),
         name="conv2d_transpose_3",
     )(x)
+    x = layers.Conv2DTranspose(
+        numHiddenUnits,
+        (7, 7),
+        strides=2,
+        activation="relu",
+        padding="same",
+        kernel_regularizer=l2(reg_val),
+        activity_regularizer=l2(reg_val),
+        bias_regularizer=l2(reg_val),
+        name="conv2d_transpose_4",
+    )(x)
     residual = layers.Conv2D(
         numResponses,
         (1, 1),
@@ -478,7 +522,10 @@ def SRDN_ResAFNO_v4(
         in_channels=128, out_channels=96, name="upsample_stage2_256"
     )(x, condition=cond_emb)
     x = ProgressiveUpsampleBlock(
-        in_channels=96, out_channels=64, name="upsample_stage3_512"
+        in_channels=96, out_channels=64, name="upsample_stage3_256"
+    )(x, condition=cond_emb)
+    x = ProgressiveUpsampleBlock(
+        in_channels=64, out_channels=48, name="upsample_stage4_512"
     )(x, condition=cond_emb)
     x = layers.Conv2D(32, 3, padding="same", activation="gelu", name="head_conv1")(
         x

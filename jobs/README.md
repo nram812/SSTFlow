@@ -43,6 +43,19 @@ submission.  All commands assume the repository root as the working directory.
 - `render_flow_ar_legacy_coarse_balanced_animation.pbs`: one specific AR animation.
 - `postprocess_coarse_balanced_ar_comparison.pbs`: refresh AR comparison metrics.
 
+## SRDN 16x ResAFNO validation
+
+| Stage | Launcher | Output / gate |
+|---|---|---|
+| CPU diagnostics | `SRDN/test_diagnostics.py`, `SRDN/test_real_data.py` | mask, AFNO, projection, and real-data contract |
+| H200 gate | `srdn_gpu_smoke.pbs` | `runs/smoke/srdn_gpu/report.json` |
+| 10k matched pilots | `srdn_train_pilot.pbs` with `MODEL=srdcnn` and `MODEL=resafno` | `runs/srdn_*_pilot_10k` |
+| Full training | `srdn_train_full.pbs` with `MODEL=srdcnn` and `MODEL=resafno` | `runs/srdn_*_mask_aware_f16` |
+| Held-out evaluation | `srdn_evaluate.pbs` | `runs/srdn_comparison.json` |
+
+These jobs use `SRDN/environment.md` and deliberately require the separate
+`venv_srdn_gpu`; the old notebook `venv_srdn` is CPU-only and incomplete.
+
 ## Diagnostic or superseded launchers
 
 Files named `check_*`, `profile_*`, `preflight_*`, `bridge_*`, or

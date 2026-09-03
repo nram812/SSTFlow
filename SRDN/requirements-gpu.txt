@@ -1,0 +1,9 @@
+# Pinned H200 environment.  The TensorFlow extra installs matching CUDA
+# runtime wheels; the PBS gate rejects CPU fallback.
+tensorflow[and-cuda]==2.15.1
+numpy==1.26.4
+scipy==1.11.4
+xarray==2024.2.0
+netCDF4==1.6.5
+matplotlib==3.8.3
+pytest==8.1.1

@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N srdn-gpu-smoke
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit from the SSTDownscaling root}"
+PYBIN="${PYBIN:-$PWD/SRDN/venv_srdn_gpu/bin/python}"
+if [[ ! -x "$PYBIN" ]]; then
+  echo "Missing GPU Python: $PYBIN" >&2
+  exit 2
+fi
+export PYTHONPATH="$PWD/SRDN"
+export MPLBACKEND=Agg
+"$PYBIN" -u jobs/srdn_gpu_smoke.py
