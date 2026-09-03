@@ -32,7 +32,7 @@ def main() -> None:
     output = root / "runs" / "gpu_smoke"; output.mkdir(parents=True, exist_ok=True)
     report = {"device": torch.cuda.get_device_name(device), "torch": torch.__version__}
     configs = {name: load_config(root / "configs" / filename) for name, filename in
-               (("flow", "flow_sr.json"), ("flow_ar", "flow_ar.json"), ("gan", "gan_sr.json"))}
+               (("flow", "flow_sr.json"), ("flow_ar", "flow_ar.json"), ("gan", "gan_sr_v3_hard_consistency.json"))}
     normalization = engine.load_normalization(configs["flow"])
     derived = DerivedProduct(configs["flow"]["derived_path"])
     normalization = attach_ocean_mask(normalization, derived.ocean_mask)
@@ -50,12 +50,72 @@ def main() -> None:
     config = configs["gan"]; dataset = build_dataset(config, normalization, config["smoke_date_ranges"], "super_resolution", derived=derived)
     batch = engine.batch_to_device(engine.collate_indices(dataset, np.arange(int(config["batch_size"]))), device)
     generator = build_generator(config).to(device); discriminator = build_discriminator(config).to(device)
-    torch.cuda.reset_peak_memory_stats(); fake = generator(batch["condition"], batch["mask"])
-    loss = 10 * masked_mse(fake, batch["target"], batch["mask"]) + hinge_generator_loss(discriminator(fake, batch["condition"], batch["mask"]))
-    loss = loss + hinge_discriminator_loss(discriminator(batch["target"], batch["condition"], batch["mask"]), discriminator(fake.detach(), batch["condition"], batch["mask"]))
-    engine.check_finite(loss, 0, "gan"); loss.backward(); torch.cuda.synchronize()
-    report["gan"] = {"loss": float(loss), "peak_memory_mb": peak_mb(), "batch_size": int(config["batch_size"])}
-    del loss, fake, generator, discriminator, batch, dataset; torch.cuda.empty_cache()
+    generator_optimizer = torch.optim.Adam(generator.parameters(), lr=1.0e-4)
+    discriminator_optimizer = torch.optim.Adam(discriminator.parameters(), lr=1.0e-4)
+    noise = generator.sample_noise(batch["condition"])
+    torch.cuda.reset_peak_memory_stats()
+
+    # Exercise a genuine alternating update, then require a second generator
+    # update to reach the spatial trunk through the deliberately zero-init head.
+    with torch.no_grad():
+        fake = generator(batch["condition"], batch["mask"], noise=noise)
+    critic_loss = hinge_discriminator_loss(
+        discriminator(batch["target"], batch["condition"], batch["mask"]),
+        discriminator(fake, batch["condition"], batch["mask"]),
+    )
+    engine.check_finite(critic_loss, 0, "gan critic")
+    critic_loss.backward(); discriminator_optimizer.step(); discriminator_optimizer.zero_grad(set_to_none=True)
+
+    stem_gradient = 0.0
+    for update in range(2):
+        for parameter in discriminator.parameters(): parameter.requires_grad_(False)
+        fake = generator(batch["condition"], batch["mask"], noise=noise)
+        generator_loss = (
+            float(config["lambda_content"]) * masked_mse(fake, batch["target"], batch["mask"])
+            + float(config["lambda_adversarial"])
+            * hinge_generator_loss(discriminator(fake, batch["condition"], batch["mask"]))
+        )
+        engine.check_finite(generator_loss, update, "gan generator")
+        generator_loss.backward()
+        if update == 1 and generator.stem.weight.grad is not None:
+            stem_gradient = float(generator.stem.weight.grad.norm())
+        generator_optimizer.step(); generator_optimizer.zero_grad(set_to_none=True)
+        for parameter in discriminator.parameters(): parameter.requires_grad_(True)
+
+    with torch.no_grad():
+        fake = generator(batch["condition"], batch["mask"], noise=noise)
+        baseline = torch.nn.functional.interpolate(
+            batch["condition"][:, :1], size=fake.shape[-2:], mode="bilinear",
+            align_corners=False,
+        ) * batch["mask"]
+        residual = (fake - baseline)[batch["mask"].bool()]
+        residual_spatial_std = float(residual.std())
+        gan_consistency_mse = float(
+            coarse_consistency_mse(fake, batch["condition"], batch["mask"])
+        )
+    if (
+        stem_gradient <= 0.0
+        or residual_spatial_std <= 1.0e-8
+        or gan_consistency_mse > 1.0e-10
+    ):
+        raise AssertionError(
+            f"GAN spatial path is inactive: stem_grad={stem_gradient}, "
+            f"residual_std={residual_spatial_std}, "
+            f"coarse_consistency_mse={gan_consistency_mse}"
+        )
+    torch.cuda.synchronize()
+    report["gan"] = {
+        "critic_loss": float(critic_loss),
+        "generator_loss": float(generator_loss),
+        "stem_gradient_after_second_update": stem_gradient,
+        "residual_spatial_std_after_two_updates": residual_spatial_std,
+        "coarse_consistency_mse_normalized": gan_consistency_mse,
+        "peak_memory_mb": peak_mb(),
+        "batch_size": int(config["batch_size"]),
+    }
+    del generator_loss, critic_loss, fake, generator, discriminator, batch, dataset
+    del generator_optimizer, discriminator_optimizer
+    torch.cuda.empty_cache()
 
     config = configs["flow"]; dataset = build_dataset(config, normalization, config["smoke_date_ranges"], "super_resolution", derived=derived)
     raw = engine.collate_indices(dataset, [0]); batch = engine.batch_to_device(raw, device); model = build_model(config).to(device).eval()
