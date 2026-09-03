@@ -139,6 +139,8 @@ def train(
     tf.random.set_seed(seed)
     if output_dir_override is not None:
         run_dir = Path(output_dir_override)
+        if not run_dir.is_absolute():
+            run_dir = Path(config["config_path"]).parent.parent / run_dir
     else:
         run_dir = Path(
             config["smoke_output_dir"] if smoke_steps is not None else config["output_dir"]
@@ -193,12 +195,17 @@ def train(
     started = time.monotonic()
     deadline = started + 3600.0 * float(config.get("max_runtime_hours", 23.0))
     batch_size = int(config.get("batch_size", 2))
-    epoch = step // max(1, len(train_data) // batch_size)
+    batches_per_epoch = max(1, (len(train_data) + batch_size - 1) // batch_size)
+    epoch, batch_offset = divmod(step, batches_per_epoch)
 
     try:
         while step < max_steps:
             made_batch = False
-            for inputs, target in train_data.iter_epoch(batch_size, seed, epoch):
+            for batch_index, (inputs, target) in enumerate(
+                train_data.iter_epoch(batch_size, seed, epoch)
+            ):
+                if batch_index < batch_offset:
+                    continue
                 if step >= max_steps:
                     break
                 made_batch = True
@@ -237,6 +244,7 @@ def train(
             if not made_batch:
                 raise RuntimeError("training dataset yielded no batches")
             epoch += 1
+            batch_offset = 0
             if time.monotonic() >= deadline:
                 break
     except Exception as error:

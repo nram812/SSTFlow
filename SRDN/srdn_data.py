@@ -74,6 +74,10 @@ class DerivedProduct:
             self.coarsen_factor = int(getattr(dataset, "coarsen_factor", 16))
         if self.sst_lr.shape[0] != len(self.dates):
             raise ValueError("derived time and sst_lr dimensions disagree")
+        if tuple(self.sst_lr.shape[1:]) != self.ocean_mask_lr.shape:
+            raise ValueError("derived coarse predictor and mask shapes disagree")
+        if self.valid_fraction_lr.shape != self.ocean_mask_lr.shape:
+            raise ValueError("derived valid-fraction and coarse-mask shapes disagree")
         if self.ocean_mask.shape != (len(self.lat), len(self.lon)):
             raise ValueError("derived high-resolution mask shape is inconsistent")
         if self.source_mask_sha256:
@@ -130,6 +134,16 @@ class SRDNData:
         )
         if expected_hash and expected_hash != actual_hash:
             raise ValueError("normalization and derived mask fingerprints disagree")
+        expected_grid = tuple(self.normalization.get("grid_shape", self.derived.fine_shape))
+        expected_coarse = tuple(
+            self.normalization.get("coarse_grid_shape", self.derived.coarse_shape)
+        )
+        if expected_grid != self.derived.fine_shape:
+            raise ValueError("normalization and derived fine-grid shapes disagree")
+        if expected_coarse != self.derived.coarse_shape:
+            raise ValueError("normalization and derived coarse-grid shapes disagree")
+        if int(self.normalization.get("coarsen_factor", self.derived.coarsen_factor)) != self.derived.coarsen_factor:
+            raise ValueError("normalization and derived coarsen factors disagree")
 
     def _open_source(self):
         if self._source is None:

@@ -104,6 +104,21 @@ print("distant response:", distant_response)
 print("translation-equivariance max error:", equivariance_error)
 assert distant_response > 1e-8
 assert equivariance_error < 1e-4
+
+yy, xx = np.mgrid[0:64, 0:64]
+single_mode = np.cos(2 * np.pi * (5 * yy / 64 + 3 * xx / 64))
+single_input = np.zeros([1, 64, 64, 32], dtype=np.float32)
+single_input[0, ..., 0] = single_mode
+single_output = afno(tf.constant(single_input))
+single_spectrum = tf.signal.fft2d(
+    tf.cast(tf.transpose(single_output, [0, 3, 1, 2]), tf.complex64)
+).numpy()
+single_power = np.abs(single_spectrum[0]) ** 2
+single_power[:, 0, 0] = 0.0
+mode_fraction = float((single_power[:, 5, 3] + single_power[:, -5, -3]).sum() /
+                     max(single_power.sum(), 1e-12))
+print("single-mode power fraction:", mode_fraction)
+assert mode_fraction > 0.99
 """
     ),
     markdown(

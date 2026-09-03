@@ -103,8 +103,29 @@ def test_5_shift_equivariance():
     assert relative < 1e-4
 
 
-def test_6_cpu_training_on_synthetic_sst():
-    print("\nTEST 6: five-step CPU training on synthetic 16x SST fields")
+def test_6_spectral_response():
+    print("\nTEST 6: single-mode spectral response")
+    H, W, C = 64, 64, 32
+    yy, xx = np.mgrid[0:H, 0:W]
+    mode_y, mode_x = 5, 3
+    field = np.cos(2.0 * np.pi * (mode_y * yy / H + mode_x * xx / W))
+    x = np.zeros([1, H, W, C], dtype=np.float32)
+    x[0, ..., 0] = field
+    afno = AFNO2D(embed_dim=C, num_blocks=4, sparsity_threshold=0.0)
+    output = afno(tf.constant(x))
+    spectrum = tf.signal.fft2d(
+        tf.cast(tf.transpose(output, [0, 3, 1, 2]), tf.complex64)
+    ).numpy()
+    power = np.abs(spectrum[0]) ** 2
+    power[:, 0, 0] = 0.0
+    expected = power[:, mode_y, mode_x] + power[:, -mode_y, -mode_x]
+    ratio = float(expected.sum() / max(power.sum(), 1.0e-12))
+    print(f"expected-mode power fraction={ratio:.6f}")
+    assert ratio > 0.99
+
+
+def test_7_cpu_training_on_synthetic_sst():
+    print("\nTEST 7: five-step CPU training on synthetic 16x SST fields")
     np.random.seed(42)
     tf.random.set_seed(42)
     B, fine, shrink = 2, 512, 16
@@ -146,6 +167,7 @@ def test_6_cpu_training_on_synthetic_sst():
             loss = tf.reduce_mean(tf.square(model(inputs, training=True) - truth))
         gradients = tape.gradient(loss, model.trainable_variables)
         assert all(gradient is not None for gradient in gradients)
+        assert all(np.isfinite(gradient.numpy()).all() for gradient in gradients)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
     final = float(loss_value().numpy())
     print(f"initial loss={initial:.6f}; final loss={final:.6f}")
@@ -153,8 +175,8 @@ def test_6_cpu_training_on_synthetic_sst():
     assert final < initial
 
 
-def test_7_coarse_projection_and_land_mask():
-    print("\nTEST 7: exact coarse consistency and hard land mask")
+def test_8_coarse_projection_and_land_mask():
+    print("\nTEST 8: exact coarse consistency and hard land mask")
     projection = CoarseConsistencyProjection(shrink=2)
     values = tf.zeros([1, 4, 4, 1])
     coarse = tf.constant([[[[2.0], [3.0]], [[4.0], [5.0]]]])
@@ -175,8 +197,9 @@ if __name__ == "__main__":
         test_3_film_modulation,
         test_4_controlled_nonlocal_perturbation,
         test_5_shift_equivariance,
-        test_6_cpu_training_on_synthetic_sst,
-        test_7_coarse_projection_and_land_mask,
+        test_6_spectral_response,
+        test_7_cpu_training_on_synthetic_sst,
+        test_8_coarse_projection_and_land_mask,
     ):
         test()
     print("\nALL AFNO/SRDN DIAGNOSTICS PASSED")

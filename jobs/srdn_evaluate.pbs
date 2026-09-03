@@ -7,14 +7,15 @@
 set -euo pipefail
 cd "${PBS_O_WORKDIR:?submit from the SSTDownscaling root}"
 PYBIN="${PYBIN:-$PWD/SRDN/venv_srdn_gpu/bin/python}"
+RUN_TAG="${RUN_TAG:-mask_aware_f16}"
 if [[ ! -x "$PYBIN" ]]; then echo "Missing GPU Python: $PYBIN" >&2; exit 2; fi
 export PYTHONPATH="$PWD/SRDN"
 for MODEL in srdcnn resafno; do
   "$PYBIN" -u SRDN/evaluate_srdn.py \
-    --run "runs/srdn_${MODEL}_mask_aware_f16" \
+    --run "runs/srdn_${MODEL}_${RUN_TAG}" \
     --config "configs/srdn_${MODEL}.json" --batch-size 2
 done
 "$PYBIN" -u SRDN/compare_srdn.py \
-  --resafno-run runs/srdn_resafno_mask_aware_f16 \
-  --srdcnn-run runs/srdn_srdcnn_mask_aware_f16 \
-  --output runs/srdn_comparison.json
+  --resafno-run "runs/srdn_resafno_${RUN_TAG}" \
+  --srdcnn-run "runs/srdn_srdcnn_${RUN_TAG}" \
+  --output "runs/srdn_comparison_${RUN_TAG}.json"

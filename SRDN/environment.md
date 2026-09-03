@@ -31,3 +31,9 @@ The pinned GPU install follows TensorFlow's documented `tensorflow[and-cuda]`
 packaging path.  The code additionally checks physical and logical GPU
 visibility in `jobs/srdn_gpu_smoke.py`; no training job should be interpreted
 as a GPU result unless that gate passes.
+
+On H200 job 6409858, TensorFlow 2.15.1 successfully used the GPU and loaded
+cuDNN 8.9.4, but reported no native SM90 binary and therefore JIT-compiled
+from PTX.  This is functionally valid but can add startup time; a future
+performance pass should benchmark a newer TensorFlow build with native H200
+kernels before production-scale timing claims.
