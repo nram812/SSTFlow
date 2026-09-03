@@ -12,4 +12,7 @@ figures/
 *.o[0-9]*
 *.e[0-9]*
 sst_10km_OFAM_historical_Australia.nc
+sst_10km_OFAM_rcp8p5_Australia.nc
 Untitled.ipynb
+venv*/
+SRDN/venv_srdn/
