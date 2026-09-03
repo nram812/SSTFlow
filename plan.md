@@ -156,7 +156,13 @@ u    = target − noise
 loss = masked_mse(v_θ(z, cond, mask, t[, y_prev]), u)
 ```
 
-Samplers: `euler`, `heun` (2 evaluations/step, default), `ab2` (2nd order, 1 evaluation/step). All re-apply the mask after every update so land can never drift. `heun_sample` is deliberately **not** wrapped in `no_grad` so it doubles as the differentiable rollout solver.
+Samplers: `euler`, `heun` (2 evaluations/step, default), `ab2` (2nd order,
+1 evaluation/step), `ab2_pc` (AB2 predictor plus trapezoidal AM2 corrector),
+and `ab3_pc` (AB3/AM3 predictor-corrector). All re-apply the mask after every
+update so land can never drift. Solver velocity history is local to one flow
+ODE sample and never crosses a batch item or physical autoregressive day.
+`heun_sample` is deliberately **not** wrapped in `no_grad` so it doubles as the
+differentiable rollout solver.
 
 The differentiable single-step rollout penalty has been retired. AR training now uses the same masked velocity objective as ordinary flow matching. `flow.rollout` remains only as a multi-day diagnostic and projects every generated day onto that day's coarse input before chaining it as lag guidance.
 
@@ -259,7 +265,7 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] `src/data.py` — `DerivedProduct`, worker-safe `_SourceReader`, `SuperResolutionDataset`, `AutoregressiveSuperResolutionDataset`, `build_dataset` factory; NaN→0 after normalisation; fingerprint verification.
 - [x] `src/losses.py` — masked mean/MSE/L1/RMSE/bias, masked spectral loss, inert conservation loss, hinge GAN losses.
 - [x] `src/model.py` — shared backbone, autoregressive variant with throttled lag pathway, `build_model` factory.
-- [x] `src/flow.py` — masked rectified-flow loss, Euler/Heun/AB2 samplers, free-running diagnostic rollout, and optional coarse projection.
+- [x] `src/flow.py` — masked rectified-flow loss, Euler/Heun/AB2/AB2-PC/AB3-PC samplers, free-running diagnostic rollout, and optional coarse projection.
 - [x] `src/callbacks.py` — 5-panel preview (coarse / truth / generated / error / radial spectrum), loss curves, NetCDF writers for samples and rollouts, rollout-skill plot, metrics JSON.
 - [x] `src/engine.py` — EMA, warmup+cosine schedule, resumable checkpoints with RNG state, non-finite guards, wall-clock guard, `status.json`, deterministic preview batching.
 - [x] `src/train_flow.py` — experiment 1 end to end.
@@ -275,7 +281,7 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] **B6** `tests/` — the full matrix in Part C (including conditioning-ablation, coarse-authority, converted-ACCESS, solver, and GAN critic-freeze regressions).
 - [x] **B7** `jobs/*.pbs` — `preprocess.pbs` (shortq), `cpu_tests.pbs` (shortq), `gpu_smoke.pbs` (h200q), `train_flow.pbs` / `train_flow_ar.pbs` / `train_gan.pbs` (h200q, self-resubmitting on `status == "checkpointed"`).
 - [x] **B8** Real preprocessing complete: mean 19.833256 °C, std 8.699326 °C, 32 × 32 coarse grid, 716 valid coarse cells.
-- [x] **B9** Full CPU suite green: 131 passed, 1 restricted-sandbox skip (2026-08-27); the two-worker DataLoader check remains verified on a PBS node.
+- [x] **B9** Full CPU suite green: 165 passed, 1 restricted-sandbox skip (2026-08-31); the two-worker DataLoader check remains verified on a PBS node.
 - [x] **B10** Real-grid CPU smoke training complete for all three models (3 steps each); every run produced PNG, NetCDF, checkpoint, weights, history, and passing status. AR rollout and GAN adversarial paths were exercised.
 - [x] **B11** GPU smoke passed on an NVIDIA H200 in job `6406137`: production-batch forward/backward for all models, 11.93 GiB maximum peak allocation, 25-step Heun in 1.91 s, 10-day AR rollout in 19.34 s, and a verified NetCDF product.
 - [x] **B12** `README.md`, `AGENTS.md`, `.gitignore`, Git repository, and initial commit `8c0bb9c` created.
@@ -292,6 +298,159 @@ GAN-only: `noise_channels` (4), `generator_residual` (true), `discriminator_base
 - [x] **B23** Job `6406703` compared 100-step Heun and AB2 on the same first 30 test days and identical initial noise. Both had zero non-finite ocean pixels; AB2 was 2.04x faster and had 0.3721 °C RMSE versus Heun's 0.3759 °C. Metrics, atomic NetCDF, and the solver-difference figure passed integrity checks.
 - [x] **B24** Added and validated an AB3/AM3 predictor-corrector sampler whose two-step velocity history is confined to one ODE sample. The 100-step, same-noise 30-day comparison passed: AB3-PC RMSE was 0.3749 °C versus 0.3759 °C for Heun and 0.3721 °C for AB2, with zero non-finite ocean pixels.
 - [ ] **B25** Job `6406740` is running all 1,461 test days with the plain-flow EMA weights using only the AB3/AM3 predictor-corrector at 75 steps. Earlier full-test and solver-comparison outputs are preserved under solver-specific filenames.
+- [x] **B26** Audited the retired 114,000-step `runs/gan_sr` production
+  artefacts. Only 1 of 140 generator parameter tensors had a non-zero Adam
+  first moment: the final scalar bias. The final head weight remained exactly
+  zero, and saved generated-minus-bilinear fields had spatial standard deviation
+  near `1e-6` °C. Fixed the GAN-v2 critic mask reduction and discriminator LR
+  schedule, added spatial-learning regressions, and passed H200 job `6408332`
+  with a non-zero trunk gradient (`6.79e-5`) and spatial residual standard
+  deviation (`1.09e-3`) after two real updates.
+- [x] **B27** Added GAN-v3 as a separate experiment with the GAN-v2 formulation
+  and an exact differentiable coarse-consistency projection. Unit, full-grid CPU,
+  checkpoint, callback, and H200 alternating-update tests passed. H200 job
+  `6408343` measured normalized re-coarsening MSE `1.03e-13`, a non-zero spatial
+  trunk gradient (`8.04e-5`), residual spatial standard deviation `0.0488`, and
+  4.24 GiB peak memory. Production job `6408346` was then released.
+- [x] **B28** Constructed the unique combined axis from historical 1979-2014 and
+  RCP8.5 2015-2101 (44,925 gapless days), retaining historical normalization for
+  compatibility with the completed step-220,000 checkpoint. Split membership is
+  disjoint and direct target reads from both immutable source files match exactly.
+  H200 job `6408347` loaded both sources with spawned workers, restored model/EMA/
+  optimizer, changed a model parameter after backpropagation, and produced finite
+  5-step Heun samples at both climate endpoints (11.36 GiB peak). Production
+  continuation job `6408348` was released for steps 220,001-320,000.
+- [x] **B29** Continue corrected GAN-v2, image-only-critic GAN-v2b, and
+  hard-consistency GAN-v3 from their completed historical step-120,000
+  checkpoints to step 220,000 on the B28 historical+RCP8.5 split. Each fork has
+  an isolated `*_hist_rcp85_continue_220k` run, a constant 5e-6 learning rate,
+  immutable 10,000-step snapshots, and unchanged callbacks. H200 gate job
+  `6408535` passed all three alternating updates, spawned two-source loading,
+  noise-response and hard-consistency checks, then production jobs `6408536`,
+  `6408537`, and `6408538` completed successfully at step 220,000.
+- [x] **B30** Run direct EMA-generator inference for all three historical and all
+  three combined GANs over each configured test split and converted ACCESS-CM2
+  1980-1989/2080-2089. Products are validated for exact dates, masks,
+  finiteness, physical range, non-bilinear residuals, and GAN-v3 hard
+  consistency before being marked complete. The stale dependency-held combined
+  job was replaced by `6408778`; all 12 ACCESS products (six model versions ×
+  historical/future) and all three combined-run test products passed validation.
+- [x] **B31** Repair and reproduce the retired `runs/flow_ar` one-year test
+  rollout. The audit found a silent legacy/new lag-definition mismatch, two
+  failed rollout assembly/output paths, ignored solver overrides, and one-day
+  AR date offsets. Missing lag controls now restore the exact legacy full-state,
+  uncapped model definition; AB2/AM2 predictor-corrector, a dedicated no-reset
+  driver, atomic products, and independent validation are covered by the
+  165-test CPU suite and all nine real-data checks. H200 preflight job `6408548`
+  passed, and production job `6408550` wrote and independently validated the
+  364-lead 2011 product. It has no truth resets, finite fields, 0.539 °C overall
+  RMSE, and at most 1.35e-5 °C daily coarse-block reconstruction error.
+- [x] **B32** Replace the failed NOAA hierarchical residual transfer. Its
+  step-40,000 diagnostic measured 7.72 °C RMSE and -6.09 °C bias in the first
+  NOAA ocean pixel beside land, versus 0.53 °C RMSE and -0.01 °C bias more than
+  eight pixels inland from the coast. The cause is the hard 2×2 projection
+  across 15,060 NOAA-ocean/OFAM-land cells. Job `6408777` was stopped with its
+  artifacts preserved. The replacement freezes the complete pretrained trunk,
+  bypasses its 512² output layers, and trains a 149,201-parameter PixelShuffle
+  plus direct-1024-state head with no hard block constraint. The 165-test CPU
+  suite (164 passed, one sandbox-only skip), real-data validator, and full-grid
+  CPU smoke pass. H200 gate `6408783`
+  passed with 4.90 GiB peak allocation, a non-zero learned-upsample update,
+  bitwise-unchanged pretrained tensors, spawned NOAA workers, and finite direct
+  Heun sampling. Production job `6408784` is active and its step-5,000 durable
+  checkpoint is verified. The step-4,000 EMA diagnostic reduced whole-ocean,
+  first-coastal-pixel, and four-pixel coastal RMSE to 0.58, 0.95, and 0.77 °C,
+  respectively; the failed model measured 1.37, 7.72, and 5.48 °C. Obsolete
+  residual-flow model/trainer/config/job/test sources were subsequently deleted;
+  shared NOAA preprocessing and validation now point only to the active model.
+  At the user's step-38,000 review, job `6408784` was stopped to broaden
+  adaptation. Because the callback wrote an image at 38,000 but durable weights
+  were still on the 5,000-step cadence, the recoverable state was step 35,000;
+  short job `6408788` reconstructs a durable 38,000 state with the same
+  head-only policy. A separate continuation then trains the complete pretrained
+  bottleneck/decoder and 1024 head (4,085,557 / 5,833,610 parameters, 70.0%)
+  while keeping the encoder and bypassed legacy output frozen. It uses fresh
+  AdamW groups at 5e-5 for the head and 1e-5 for the decoder, a new 500-update
+  warmup/42,000-update cosine schedule, a separate output directory, a strict
+  step-38,000 source gate, and 2,000-step durable saves. The 168-test suite
+  passes (167 passed, one restricted-sandbox skip), both real-data validators
+  pass, and the ordinary flow/AR/clean-GAN CPU smokes pass. Decoder production
+  was released after bridge `6408788` exited 0 at exactly step 38,000 and H200
+  gate `6408791` proved non-zero decoder/head updates, a bitwise-frozen encoder,
+  finite Heun sampling, and 5.74 GiB peak allocation. Production continuation
+  `6408792` completed at step 80,000. A second isolated continuation uses its
+  exact SHA-256-locked checkpoint, a fresh lower-rate 70,000-update cosine
+  cycle, and the same 64 trainable versus 36 frozen parameterized leaf modules
+  (4,085,557 / 5,833,610 parameters). The 174-test suite has 173 passes and one
+  restricted-sandbox skip; NOAA real-data validation passes. H200 gate
+  `6408874` verified non-zero head/decoder changes, a bitwise-frozen encoder,
+  finite sampling, and 5.74 GiB peak memory. Production job `6408875` completed
+  successfully at exactly step 150,000 with 4,085,557 trainable and 1,748,053
+  frozen parameters.
+- [x] **B33** Run final NOAA-grid inference after B32 reaches step 150,000. The
+  dedicated atomic writer and validator cover the complete 2021-2023 NOAA test
+  split plus converted ACCESS-CM2 1980-1989/2080-2089. All use 75-step AB3/AM3,
+  deterministic per-date noise, the fixed NOAA target mask, and a fixed batch
+  shape of four. H200 profile `6408883` passed the NOAA and ACCESS adapters at
+  5.29 GiB peak and measured 3.43 seconds/day. Production jobs `6409183`
+  (2021-2023 NOAA test) and `6409184` (ACCESS-CM2 1980-1989/2080-2089) are
+  completed products pass independent validation: 1,094 NOAA test days plus
+  3,653 historical and 3,653 future ACCESS-CM2 days.
+- [x] **B34** Replace the legacy memory-dominated AR experiment with a
+  plain-flow-anchored residual-memory model. The successful 5,684,409-parameter
+  `flow_sr` EMA is frozen; only 382,816 lag/fusion parameters train. Memory is
+  within-block anomaly only, dropped on 50% of batches, capped at 0.15, and
+  projected to the current coarse means after each generated day. At
+  initialization it is exactly `flow_sr`. H200 gate `6408884` updated all 44
+  lag tensors, kept the backbone bitwise unchanged, produced a finite five-day
+  rollout, and achieved 1.01e-13 coarse-consistency MSE. Production job
+  `6408885` is active to step 120,000. The first learned ten-day callback
+  plateaus near 0.45 degC rather than diverging, but independent daily flow
+  noise produced 4.14 times the observed daily evolution. H200 diagnostic
+  `6408912` tested six AR(1) latent couplings; common noise reduced that ratio
+  to 2.52 with a small ten-day RMSE trade-off (0.409 to 0.435 degC). The final
+  one-year inference is therefore explicitly configured for common latent
+  noise, AB2/AM2 at 75 steps, no truth resets, and the daily coarse projection.
+  Training job `6408885` passed at exactly step 120,000. Five-day preflight
+  `6409190` exited 0 with 0.365 degC RMSE, no non-finite ocean cells, and a
+  maximum physical coarse-block error of 1.07e-5 degC; one-year production
+  rollout `6409193` completed and its 364-day, truth-reset-free 2011 product
+  passes independent validation.
+- [x] **B35** After B33/B34 products pass, refresh both evaluation notebooks,
+  regenerate model-comparison/test/climate-signal figures, and build a validated
+  50-slide deck informed by `Autoregressive-Emulators.pptx` and the established
+  flow architecture artwork. The presentation portion is now complete as
+  `presentation/SST_Downscaling_Editable_50_slides.pptx`: native PowerPoint
+  text, tables, diagrams and connectors replace the rejected full-slide raster
+  draft, while scientific plots/maps/GIFs remain media. The expanded narrative
+  includes the requested data roles and periods, separate GAN loss explanations,
+  flow and autoregressive architecture detail, FiLM diagnostics, NOAA transfer,
+  ACCESS deployment strategy, conclusions and remaining work. Structural validation,
+  aspect-ratio checks, visual contact-sheet inspection and focused
+  editability tests pass. The final notebook/result refresh now reads the
+  independently validated B33/B34/B36 products and includes the climate-signal
+  comparison generated in B37.
+- [x] **B36** Complete the inference products that were absent after the
+  historical+RCP8.5 Flow-SR reached step 320,000. Production job `6409182`
+  generates and independently validates all 2,921 configured OFAM test days
+  (2011-2014 historical plus 2098-2101 RCP8.5), then ACCESS-CM2 1980-1989 and
+  2080-2089 with 75-step AB3/AM3. This task is distinct from B33 because it
+  evaluates the 512x512 combined-climate model. All 2,921 OFAM test days and
+  both 3,653-day ACCESS-CM2 periods are complete and pass independent
+  validation.
+- [x] **B37** Add a publication-focused climate-change evaluation and editable
+  manuscript hand-off. The validated analysis separates paired perfect-model
+  OFAM errors from imperfect ACCESS-CM2 coarse-signal preservation; compares
+  combined Flow-SR and accepted GAN-v2/v2b/v3 models; and records the
+  historical-only perfect-framework comparison as outstanding rather than
+  inferring it from ACCESS-CM2. Both comparison notebooks contain tagged
+  reproducible climate sections. Repository navigation, the PBS-job catalogue,
+  and configurable GAN loss-ablation documentation are updated.
+  `SST_Downscaling_Skeleton_Paper.docx` contains native editable text/tables
+  and embedded figures and has a machine-readable structural validation
+  report. The scientifically rejected gradient-penalty continuation is
+  quarantined under `unsuccessful_experiments/` and excluded from active
+  methods, tables, and recommended workflows.
 
 ## PART C — Exhaustive test matrix
 
@@ -380,7 +539,7 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 | `test_masked_noise_is_zero_on_land` | Exactly zero over land |
 | `test_loss_is_finite_and_positive` | Both model kinds |
 | `test_loss_gradient_flows` | Non-zero gradient reaches the first conv |
-| `test_samplers_preserve_land_zero` | Euler / Heun / AB2 all keep land exactly 0 |
+| `test_samplers_preserve_land_zero` | Euler / Heun / AB2 / AB2-PC / AB3-PC all keep land exactly 0 |
 | `test_samplers_shape_and_finiteness` | Correct shape, all finite, for 1/2/5/25 steps |
 | `test_sampler_determinism_with_seed` | Same generator seed → bitwise identical output |
 | `test_heun_matches_analytic_linear_field` | For a constant-velocity dummy model, Heun integrates exactly |
@@ -388,6 +547,15 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 | `test_unknown_sampler_raises` | `ValueError` listing the valid names |
 | `test_rollout_shape_and_chaining` | `(B, L, 1, H, W)`; lead *k* depends on lead *k−1* |
 | `test_single_step_rollout_loss_backward` | Gradient flows through the unrolled solver; loss finite |
+| `test_ab2_pc_is_second_order_for_linear_ode_and_resets_history` | AB2/AM2 converges at second order and cannot leak ODE history between calls |
+
+### C6b `tests/test_flow_ar_rollout.py` and `tests/test_validate_flow_ar_rollout.py`
+
+The production AR path additionally verifies exact legacy checkpoint semantics,
+one observed initial state followed by generated states only, exact daily
+condition/target alignment, no split-boundary crossing, AB2-PC chaining,
+per-day coarse projection, stability limits, physical ocean/land masks, atomic
+schema, and independent physical-unit block-mean reconstruction.
 
 ### C7 `tests/test_gan.py` — adversarial components
 | Test | Asserts |
@@ -395,10 +563,14 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 | `test_generator_output_shape_and_mask` | Correct shape; exactly 0 over land |
 | `test_generator_starts_as_bilinear_baseline` | At init, output ≈ upsampled condition over ocean |
 | `test_generator_noise_changes_output` | Two noise draws differ |
+| `test_generator_learns_spatial_residual_instead_of_only_a_bias` | Optimisation reduces a spatial-detail loss and cannot pass by learning only a scalar offset |
 | `test_discriminator_output_shape` | Patch logits with the expected downsampling |
 | `test_discriminator_masks_land` | Editing land pixels does not change the logits |
+| `test_discriminator_excludes_invalid_patches_from_hinge_reduction` | Land patches are removed rather than retained as zero-logit hinge terms |
 | `test_one_gan_step_runs` | Critic and generator steps both produce finite grads |
 | `test_content_loss_is_single_sample` | The content term equals `masked_mse` of one sample (regression guard against an ensemble mean creeping in) |
+| `test_hard_constraint_matches_valid_coarse_ocean_means` | GAN-v3 re-coarsens exactly to the supplied valid coarse SST cells |
+| `test_hard_constraint_gradient_reaches_generator` | The exact projection remains differentiable and spatial generator parameters receive gradients |
 
 ### C8 `tests/test_callbacks.py` — products
 | Test | Asserts |
@@ -446,19 +618,27 @@ A pytest fixture writes a tiny NETCDF3 file (64 × 64, 40 days, int16-packed, a 
 
 ### C12 GPU acceptance on `h200q` — `jobs/gpu_smoke.pbs`
 1. `torch.cuda.is_available()` and the device name are logged.
-2. One forward+backward at the production batch size for all three models; peak memory reported via `torch.cuda.max_memory_allocated()`.
+2. One forward+backward at the production batch size for the flow models. For
+   GAN-v2, one critic and two generator optimizer updates assert non-zero spatial
+   trunk gradients and a non-constant learned residual; peak memory is reported.
 3. 25-step Heun sample at 512 × 512 timed; NetCDF product written and re-opened.
 4. Free-running 10-day rollout for the autoregressive model; peak memory reported.
 5. Job fails loudly (non-zero exit) on any non-finite loss.
 
 ### C13 Acceptance criteria before launching production runs
-- [x] Whole `pixi run test` suite green on CPU (120 passed, 1 restricted-sandbox skip, 2026-08-27).
+- [x] Whole `pixi run test` suite green on CPU (136 passed, 1 restricted-sandbox skip, 2026-08-31).
 - [x] `pixi run validate-data` green on the real file (all nine checks passed).
 - [x] All three CPU smoke trainings produce PNG + NetCDF + checkpoint.
-- [x] `jobs/gpu_smoke.pbs` completes on h200q within its walltime and fits in memory (job `6406137`, peak 11.93 GiB).
+- [x] Revised GAN-v2 `jobs/gpu_smoke.pbs` completes on H200 (job `6408332`,
+  exit 0, GAN peak 4.24 GiB) and proves the spatial generator path updates.
 - [ ] Flow-matching validation RMSE beats bilinear upsampling of the coarse field.
 - [ ] Autoregressive `skill_vs_persistence > 0` (otherwise re-tune `lag_path_dropout`).
-- [ ] GAN content loss decreases and the critic logits stay bounded (no divergence).
+- [ ] GAN v2 content/detail metrics improve and the critic logits stay bounded in
+  production. The legacy `runs/gan_sr` run is invalid: its two consecutive
+  zero-initialised projections allowed only a spatially constant output bias to
+  learn. The RRDB generator removes that deadlock; regression tests now require
+  spatial residual learning and ocean-only critic logits, and both GAN optimizers
+  use matched learning-rate schedules.
 
 ---
 

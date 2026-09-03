@@ -4,6 +4,26 @@ This repository trains three masked 16× sea-surface-temperature super-resolutio
 
 The complete design rationale, data forensics, task ledger, test matrix, and operational assumptions are in [plan.md](plan.md).
 
+## Where to start
+
+| If you want to… | Start here |
+|---|---|
+| Reproduce the environment and basic workflow | This README |
+| Understand a model or deployment method | [Documentation map](docs/README.md) |
+| Choose the correct PBS launcher | [Job catalogue](jobs/README.md) |
+| Change or ablate GAN losses safely | [GAN experiment guide](docs/gan_experiment_guide.md) |
+| Continue the editable paper draft | [Skeleton manuscript source](paper/SST_Downscaling_Skeleton_Paper.md) or `SST_Downscaling_Skeleton_Paper.docx` |
+| Audit every engineering decision and test | [Living project plan](plan.md) |
+| Rebuild climate-change figures and tables | `analysis/generate_climate_change_evaluation.py` |
+
+The active reference models are `flow_sr`, `flow_ar_residual_memory`,
+`gan_sr_v2`, `gan_sr_v2b_image_only_critic`, and
+`gan_sr_v3_hard_consistency`, plus their explicitly named continuations. Avoid
+unnumbered legacy GAN/AR runs unless reproducing a documented failure.
+Scientifically rejected experiments are quarantined under
+[`unsuccessful_experiments/`](unsuccessful_experiments/README.md) and are not
+part of the supported workflow or publication analysis.
+
 ## Reproduce the environment
 
 ```bash

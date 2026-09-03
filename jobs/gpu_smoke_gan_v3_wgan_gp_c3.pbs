@@ -1,9 +1,0 @@
-#!/bin/bash
-#PBS -N sst-gan-v3-wgp-smoke
-#PBS -q h200q
-#PBS -l select=1:ncpus=8:mem=96GB:ngpus=1
-#PBS -l walltime=00:30:00
-#PBS -j oe
-set -euo pipefail
-cd "${PBS_O_WORKDIR:?submit this script from the project root}"
-PYTHONPATH=src pixi run -e gpu python -u jobs/gpu_smoke_gan_v3_wgan_gp_c3.py

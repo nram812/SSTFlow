@@ -16,26 +16,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORT = ROOT / "reports/extended_evaluation/extended_model_comparison.json"
+CLIMATE_REPORT = ROOT / "reports/climate_change/requested_models_climate_change_evaluation.json"
 NOTEBOOKS = (ROOT / "testset_evaluation.ipynb", ROOT / "model_intercomparison.ipynb")
 TAG = "extended_evaluation_v1"
+CLIMATE_TAG = "climate_change_evaluation_v2"
 
 
-def markdown_cell(text: str) -> dict:
+def markdown_cell(text: str, tag: str = TAG) -> dict:
     return {
         "cell_type": "markdown",
-        "metadata": {"tags": [TAG]},
+        "metadata": {"tags": [tag]},
         "source": [line + "\n" for line in text.rstrip().splitlines()],
     }
 
 
-def code_cell(source: str, text_output: str = "") -> dict:
+def code_cell(source: str, text_output: str = "", tag: str = TAG) -> dict:
     outputs = []
     if text_output:
         outputs = [{"name": "stdout", "output_type": "stream", "text": [text_output]}]
     return {
         "cell_type": "code",
         "execution_count": None,
-        "metadata": {"tags": [TAG]},
+        "metadata": {"tags": [tag]},
         "outputs": outputs,
         "source": [line + "\n" for line in source.rstrip().splitlines()],
     }
@@ -142,11 +144,121 @@ extended_report
     return [markdown_cell(narrative), code_cell(figure_code), code_cell(provenance_code, output)]
 
 
+def climate_cells(report: dict) -> list[dict]:
+    perfect = report["perfect_framework"]
+    perfect_models = report.get("perfect_framework_models", {"flow_sr_combined": perfect})
+    perfect_signal = perfect["climate_signal"]
+    access = report["access_cm2"]
+    combined = access["flow_sr_combined"]["annual_signal_preservation"]
+    noaa = access["flow_sr_noaa_5km"]["annual_signal_preservation"]
+    perfect_labels = {
+        "flow_sr_combined": "Flow-SR, historical + future",
+        "gan_v2_combined": "GAN-v2, historical + future",
+        "gan_v2b_combined": "GAN-v2b, historical + future",
+        "gan_v3_combined": "GAN-v3, historical + future",
+    }
+    access_labels = {
+        "flow_sr_historical": "Flow-SR, historical only",
+        "flow_sr_combined": "Flow-SR, historical + future",
+        "gan_v2_historical": "GAN-v2, historical only",
+        "gan_v2_combined": "GAN-v2, historical + future",
+        "gan_v2b_historical": "GAN-v2b, historical only",
+        "gan_v2b_combined": "GAN-v2b, historical + future",
+        "gan_v3_historical": "GAN-v3, historical only",
+        "gan_v3_combined": "GAN-v3, historical + future",
+        "flow_sr_noaa_5km": "NOAA 0.05° Flow-SR transfer",
+    }
+    rows = [
+        ("Perfect OFAM", perfect_labels[key], "2011–2014", "2098–2101", value["climate_signal"])
+        for key, value in perfect_models.items()
+    ]
+    rows.extend(
+        (
+            "Imperfect ACCESS-CM2",
+            access_labels.get(key, key),
+            "1980–1989",
+            "2080–2089",
+            value["annual_signal_preservation"],
+        )
+        for key, value in access.items()
+    )
+    table = [
+        "| Framework | Model | Historical | Future | Reference ΔT | Predicted ΔT | Ratio | Signal RMSE | Spatial r |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for framework, model, historical, future, metrics in rows:
+        table.append(
+            f"| {framework} | {model} | {historical} | {future} | "
+            f"{metrics['target_mean_c']:.3f} °C | {metrics['prediction_mean_c']:.3f} °C | "
+            f"{metrics['mean_signal_ratio']:.3f} | {metrics['rmse_c']:.3f} °C | "
+            f"{metrics['spatial_correlation']:.3f} |"
+        )
+    historical = perfect["historical_skill"]
+    future = perfect["future_skill"]
+    narrative = f"""
+---
+
+# Validated climate-change evaluation
+
+Two questions are deliberately separated. In the **perfect OFAM framework**,
+the generated fine grid can be compared with paired fine-resolution truth. In
+the **imperfect ACCESS-CM2 deployment**, no fine-resolution truth exists, so
+the test is whether the generated climate-change field preserves the supplied
+32×32 ACCESS-CM2 signal after exact mask-aware re-coarsening.
+
+{chr(10).join(table)}
+
+The combined model's daily RMSE is **{historical['rmse_c']:.3f} °C** on the
+2011–2014 OFAM test and **{future['rmse_c']:.3f} °C** on the 2098–2101 test.
+Its predicted OFAM mean warming differs from truth by only
+**{perfect_signal['mean_bias_c']:+.3f} °C**. It also retains
+**{combined['mean_signal_ratio'] * 100:.1f}%** of the ACCESS-CM2 mean driving
+signal. By contrast, the NOAA decoder fine-tune retains
+**{noaa['mean_signal_ratio'] * 100:.1f}%** annually and has pronounced seasonal
+damping. This is evidence of climate-response forgetting during
+observation-only decoder fine-tuning, not evidence that the ACCESS deployment
+is inaccurate against an unavailable fine-resolution truth.
+
+All scalar map statistics are ocean-only and cosine-latitude weighted.
+Perkins skill score and SST extreme diagnostics are proposed additions and are
+not silently substituted by the existing marine-heatwave proxy.
+"""
+    figure_code = """from pathlib import Path
+from IPython.display import Image, display
+
+climate_figure_dir = Path(BASE_DIR if 'BASE_DIR' in globals() else '.') / 'figures/climate_change'
+for filename in (
+    'flow_sr_combined_ofam_climate_change_signal.png',
+    'flow_sr_combined_ofam_signal_error_and_seasons.png',
+    'access_cm2_signal_preservation_requested_models.png',
+    'access_cm2_signal_preservation_seasonal.png',
+    'ofam_combined_flow_gan_climate_signal_comparison.png',
+    'access_cm2_flow_gan_training_period_comparison.png',
+    'access_cm2_flow_gan_signal_ratio_comparison.png',
+):
+    path = climate_figure_dir / filename
+    if path.is_file():
+        display(Image(filename=str(path)))
+"""
+    provenance_code = """import json
+from pathlib import Path
+
+climate_report_path = Path(BASE_DIR if 'BASE_DIR' in globals() else '.') / 'reports/climate_change/requested_models_climate_change_evaluation.json'
+climate_change_report = json.loads(climate_report_path.read_text())
+climate_change_report
+"""
+    return [
+        markdown_cell(narrative, CLIMATE_TAG),
+        code_cell(figure_code, tag=CLIMATE_TAG),
+        code_cell(provenance_code, json.dumps(report, indent=2) + "\n", CLIMATE_TAG),
+    ]
+
+
 def update(path: Path, additions: list[dict]) -> None:
     notebook = json.loads(path.read_text())
     retained = [
         cell for cell in notebook["cells"]
-        if TAG not in cell.get("metadata", {}).get("tags", [])
+        if not {TAG, CLIMATE_TAG}.intersection(cell.get("metadata", {}).get("tags", []))
     ]
     if path.name == "model_intercomparison.ipynb" and not any(
         "Exploratory provenance" in "".join(cell.get("source", []))
@@ -170,7 +282,10 @@ def main() -> None:
     if not REPORT.is_file():
         raise FileNotFoundError(REPORT)
     report = json.loads(REPORT.read_text())
+    climate_report = json.loads(CLIMATE_REPORT.read_text()) if CLIMATE_REPORT.is_file() else None
     additions = cells(report)
+    if climate_report is not None:
+        additions.extend(climate_cells(climate_report))
     for notebook in NOTEBOOKS:
         update(notebook, additions)
         print(f"updated {notebook}")
