@@ -1,0 +1,10 @@
+#!/bin/bash
+#PBS -N sst-noaa-38k
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+PYTHONPATH=src pixi run -e gpu python -u src/train_flow_noaa_5km_v2.py \
+  --config configs/flow_sr_noaa_5km_head_bridge_38k.json

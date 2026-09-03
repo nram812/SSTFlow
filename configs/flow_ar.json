@@ -27,6 +27,7 @@
   "lag_dropout": 0.1,
   "lag_path_dropout": 0.5,
   "lag_guidance_scale": 0.25,
+  "lag_conditioning": "within_block_anomaly",
   "enforce_coarse_consistency": true,
 
   "horizon": 1,

@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from conftest import make_config, synthetic_fields, write_source
 from data import (
     AutoregressiveSuperResolutionDataset,
     DerivedProduct,
@@ -229,3 +230,49 @@ def test_build_dataset_factory(config, normalization, derived):
         )
     plain.close()
     auto.close()
+
+
+def test_combined_preprocess_and_reader_map_unique_days_to_two_sources(
+    tmp_path, normalization
+):
+    import netCDF4
+    from preprocess_combined import run
+
+    fields, _ = synthetic_fields()
+    first = tmp_path / "historical.nc"
+    second = tmp_path / "future.nc"
+    write_source(first, fields[:20])
+    write_source(second, fields[20:])
+    with netCDF4.Dataset(second, "a") as source:
+        source.variables["Time"][:] = np.arange(20, 40, dtype=np.float64)
+
+    combined = make_config(tmp_path, "combined")
+    combined.update(
+        source_paths=[str(first), str(second)],
+        source_date_ranges=[
+            ["1979-01-01", "1979-01-20"],
+            ["1979-01-21", "1979-02-09"],
+        ],
+        derived_path=str(tmp_path / "combined_derived.nc"),
+        train_date_ranges=[["1979-01-01", "1979-02-09"]],
+    )
+    summary = run(combined, chunk=7, probe_days=4)
+    derived = DerivedProduct(combined["derived_path"])
+    dataset = SuperResolutionDataset(
+        combined, normalization, combined["train_date_ranges"], derived=derived
+    )
+
+    assert summary["days"] == 40
+    assert np.array_equal(derived.source_id[:20], np.zeros(20, dtype=np.int16))
+    assert np.array_equal(derived.source_id[20:], np.ones(20, dtype=np.int16))
+    assert np.array_equal(derived.source_index[:20], np.arange(20))
+    assert np.array_equal(derived.source_index[20:], np.arange(20))
+    expected = (fields[20] - normalization["sst_mean"]) / normalization["sst_std"]
+    ocean = dataset[20]["mask"][0].bool()
+    torch.testing.assert_close(
+        dataset[20]["target"][0][ocean],
+        torch.from_numpy(expected.astype(np.float32))[ocean],
+        atol=2.0e-3,
+        rtol=0,
+    )
+    dataset.close()

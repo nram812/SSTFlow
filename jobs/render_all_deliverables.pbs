@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -N sst-render-deliverables
+#PBS -q shortq
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -l walltime=01:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+
+echo "================================================================="
+echo "Running Deliverables Rendering Job on $(hostname)"
+echo "Time: $(date)"
+echo "================================================================="
+
+export PYTHONPATH="src:${PYTHONPATH:-}"
+export MPLBACKEND="Agg"
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+PYTHON=".pixi/envs/default/bin/python"
+
+$PYTHON -u derived/render_all_deliverables.py
+
+echo "================================================================="
+echo "Finished at $(date)"
+echo "================================================================="

@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -N sst-render-all
+#PBS -q shortq
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -l walltime=01:30:00
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+
+echo "================================================================="
+echo "Starting Animation & Figure Rendering on $(hostname)"
+echo "Time: $(date)"
+echo "================================================================="
+
+export PYTHONPATH="src:${PYTHONPATH:-}"
+export MPLBACKEND="Agg"
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+PYTHON=".pixi/envs/default/bin/python"
+
+echo "1. Generating Multi-Model Figure Evaluations (Parts 1, 2, 3)..."
+$PYTHON -u derived/generate_multimodel_evaluation_figures.py
+
+echo "2. Generating GAN Animation (GIF + MP4)..."
+$PYTHON -u figures/animate_gan_sr_sst.py --layout-only
+$PYTHON -u figures/animate_gan_sr_sst.py --output figures/gan_sr_sst_comparison.gif --fps 4 --stride 2
+$PYTHON -u figures/animate_gan_sr_sst.py --output figures/gan_sr_sst_comparison.mp4 --fps 8 --stride 1
+
+echo "3. Generating Autoregressive Flow-AR Animation (GIF + MP4)..."
+$PYTHON -u figures/animate_flow_ar_sst.py --layout-only
+$PYTHON -u figures/animate_flow_ar_sst.py --output figures/flow_ar_residual_memory_sst_preview.gif --fps 6 --stride 5 --max-frames 60 --dpi 60
+$PYTHON -u figures/animate_flow_ar_sst.py --output figures/flow_ar_residual_memory_sst_comparison_300frames.mp4 --fps 10 --stride 1 --max-frames 300 --dpi 90
+
+echo "4. Generating Intercomparison Animation (Flow vs GAN vs Low-Res vs OFAM)..."
+$PYTHON -u figures/animate_flow_gan_sr_sst.py --layout-only
+$PYTHON -u figures/animate_flow_gan_sr_sst.py --output figures/flow_gan_sr_sst_comparison.gif --fps 4 --stride 2
+$PYTHON -u figures/animate_flow_gan_sr_sst.py --output figures/flow_gan_sr_sst_comparison.mp4 --fps 8 --stride 1
+
+echo "================================================================="
+echo "All Animations and Figures Rendered Successfully!"
+echo "Time: $(date)"
+echo "================================================================="

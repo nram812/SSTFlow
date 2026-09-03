@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -N sst-noaa-v2
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+PYTHONPATH=src pixi run -e gpu python -u src/train_flow_noaa_5km_v2.py \
+  --config configs/flow_sr_noaa_5km_frozen_trunk_1024.json
+status=$(pixi run python -c 'import json; print(json.load(open("runs/flow_sr_noaa_5km_frozen_trunk_1024/status.json"))["status"])')
+if [[ "$status" == checkpointed ]]; then qsub jobs/train_flow_noaa_5km_v2.pbs; fi

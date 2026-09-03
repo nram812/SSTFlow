@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from consistency import project_to_coarse
+
 
 def resize(values: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     return F.interpolate(values, size=size, mode="bilinear", align_corners=False)
@@ -71,12 +73,13 @@ class Generator(nn.Module):
     def __init__(self, base_channels=48, levels=4, condition_channels=2,
                  target_channels=1, noise_channels=4, attention=True,
                  attention_heads=4, residual=True, rrdb_blocks=4,
-                 growth_channels=24):
+                 growth_channels=24, enforce_coarse_consistency=False):
         super().__init__()
         del attention, attention_heads
         self.noise_channels = int(noise_channels)
         self.target_channels = int(target_channels)
         self.residual = bool(residual)
+        self.enforce_coarse_consistency = bool(enforce_coarse_consistency)
         self.levels = int(levels)
         self.stem = nn.Conv2d(condition_channels + noise_channels + 1, base_channels, 3, padding=1)
         self.trunk = nn.Sequential(*[
@@ -121,7 +124,10 @@ class Generator(nn.Module):
         output = self.head(hidden)
         if self.residual:
             output = output + resize(condition[:, :self.target_channels], target_shape)
-        return output * ocean_mask
+        output = output * ocean_mask
+        if self.enforce_coarse_consistency:
+            output = project_to_coarse(output, condition, ocean_mask)
+        return output
 
 
 class SpectralConvBlock(nn.Module):
@@ -156,30 +162,59 @@ class PatchCritic(nn.Module):
             features.append(hidden)
         logits = self.output(hidden)
         patch_mask = (resize(mask, logits.shape[-2:]) > 0.5).to(logits.dtype)
-        return logits * patch_mask, features
+        return logits, patch_mask, features
 
 
 class Discriminator(nn.Module):
-    """Native/half-resolution conditional PatchGAN critics."""
+    """Native/half-resolution PatchGAN critics.
+
+    ``condition_on_coarse=False`` and ``condition_on_mask=False`` provide a
+    strict image-only critic ablation.  The ocean mask is still used to zero
+    invalid field pixels and to exclude invalid output patches from the loss,
+    but it is not then concatenated to the critic input.
+    """
 
     def __init__(self, base_channels=32, levels=4, condition_channels=2,
-                 target_channels=1, scales=2):
+                 target_channels=1, scales=2, condition_on_coarse=True,
+                 condition_on_mask=True):
         super().__init__()
-        inputs = target_channels + condition_channels + 1
+        self.condition_on_coarse = bool(condition_on_coarse)
+        self.condition_on_mask = bool(condition_on_mask)
+        inputs = target_channels
+        if self.condition_on_coarse:
+            inputs += condition_channels
+        if self.condition_on_mask:
+            inputs += 1
         self.critics = nn.ModuleList([
             PatchCritic(inputs, base_channels, levels) for _ in range(scales)
         ])
 
     def forward(self, field, condition, ocean_mask, return_features=False):
-        values = torch.cat((field * ocean_mask, resize(condition, field.shape[-2:]), ocean_mask), dim=1)
+        critic_inputs = [field * ocean_mask]
+        if self.condition_on_coarse:
+            critic_inputs.append(resize(condition, field.shape[-2:]))
+        if self.condition_on_mask:
+            critic_inputs.append(ocean_mask)
+        values = torch.cat(critic_inputs, dim=1)
         mask = ocean_mask
         logits, all_features, all_masks = [], [], []
         for index, critic in enumerate(self.critics):
             if index:
                 values = F.avg_pool2d(values, 2)
                 mask = F.avg_pool2d(mask, 2)
-            score, features = critic(values, mask)
-            logits.append(score.flatten(1))
+            score, patch_mask, features = critic(values, mask)
+            # Do not retain invalid patches as zero-valued logits.  A zero logit
+            # contributes one unit to *each* hinge-critic term, creating an
+            # irreducible loss floor and diluting both players' gradients.  The
+            # ocean mask is static, so every item has the same valid-patch count.
+            valid = patch_mask.bool().flatten(1)
+            counts = valid.sum(dim=1)
+            if counts.numel() == 0 or int(counts.min()) == 0:
+                raise ValueError("critic has no valid ocean patches")
+            if not torch.equal(counts, counts[:1].expand_as(counts)):
+                raise ValueError("critic ocean-patch count differs within the batch")
+            selected = score.flatten(1)[valid].reshape(score.shape[0], -1)
+            logits.append(selected)
             all_features.extend(features)
             all_masks.extend([resize(mask, feature.shape[-2:]) for feature in features])
         joined = torch.cat(logits, dim=1)
@@ -200,6 +235,9 @@ def build_generator(config: dict) -> Generator:
         residual=bool(config.get("generator_residual", True)),
         rrdb_blocks=int(config.get("rrdb_blocks", 4)),
         growth_channels=int(config.get("growth_channels", 24)),
+        enforce_coarse_consistency=bool(
+            config.get("enforce_coarse_consistency", False)
+        ),
     )
 
 
@@ -210,4 +248,10 @@ def build_discriminator(config: dict) -> Discriminator:
         condition_channels=int(config.get("condition_channels", 2)),
         target_channels=int(config.get("target_channels", 1)),
         scales=int(config.get("discriminator_scales", 2)),
+        condition_on_coarse=bool(
+            config.get("discriminator_condition_on_coarse", True)
+        ),
+        condition_on_mask=bool(
+            config.get("discriminator_condition_on_mask", True)
+        ),
     )

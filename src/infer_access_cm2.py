@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Downscale an already-converted ACCESS-CM2 predictor with ``flow_sr``.
+"""Downscale an already-converted ACCESS-CM2 predictor with flow or a GAN.
 
 This program does no spatial interpolation. Its input must already use the
 32 x 32 predictor grid and static ocean mask stored in the training-derived
@@ -24,6 +24,7 @@ from common import REPOSITORY_ROOT, load_json
 from data import DerivedProduct
 from flow import SAMPLERS, get_sampler
 from model import build_model
+from model_gan import build_generator
 
 
 DEFAULT_CONFIG = REPOSITORY_ROOT / "configs" / "access_cm2_inference.json"
@@ -116,17 +117,25 @@ def make_condition(
     return condition
 
 
-def load_flow_run(run_dir: Path, device: torch.device):
+def load_run(run_dir: Path, device: torch.device):
     config = load_json(run_dir / "config_used.json")
-    if config.get("model_kind") != "super_resolution":
-        raise ValueError("Converted ACCESS inference requires the plain flow_sr model")
+    kind = config.get("model_kind", "super_resolution")
+    if kind not in {"super_resolution", "gan"}:
+        raise ValueError(
+            "Converted ACCESS inference supports super_resolution flow and GAN runs, "
+            f"not {kind!r}"
+        )
     normalization = load_json(run_dir / "normalization.json")
     derived = DerivedProduct(config["derived_path"])
     derived.verify(normalization)
-    weights = run_dir / "model_ema.pt"
+    if kind == "gan":
+        model = build_generator(config)
+        weights = run_dir / "generator_ema.pt"
+    else:
+        model = build_model(config)
+        weights = run_dir / "model_ema.pt"
     if not weights.is_file():
         raise FileNotFoundError(f"Missing EMA weights: {weights}")
-    model = build_model(config)
     model.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
     return config, normalization, derived, model.to(device).eval(), weights
 
@@ -147,6 +156,19 @@ def _make_noise(shape, device, dtype, mask, seeds) -> torch.Tensor:
             )
         )
     return torch.cat(draws) * mask
+
+
+def _make_gan_noise(shape, device, dtype, seeds) -> torch.Tensor:
+    """Draw one reproducible coarse latent field per absolute time index."""
+    draws = []
+    for seed in seeds:
+        generator = torch.Generator(device=device).manual_seed(int(seed))
+        draws.append(
+            torch.randn(
+                (1, *shape[1:]), device=device, dtype=dtype, generator=generator
+            )
+        )
+    return torch.cat(draws)
 
 
 class OperationalWriter:
@@ -264,12 +286,18 @@ def run(settings: dict, device_name: str | None = None) -> Path:
     batch_size = int(settings["batch_size"])
     seed = int(settings["seed"])
     variable = str(settings.get("variable", "sst_lr"))
-    if sampler_name not in SAMPLERS or steps < 1 or batch_size < 1:
+    if steps < 1 or batch_size < 1:
         raise ValueError("Invalid sampler, sampler_steps, or batch_size")
 
-    model_config, normalization, derived, model, weights = load_flow_run(
+    model_config, normalization, derived, model, weights = load_run(
         run_dir, device
     )
+    kind = model_config.get("model_kind", "super_resolution")
+    if kind == "gan":
+        if sampler_name != "direct" or steps != 1:
+            raise ValueError("GAN ACCESS inference requires sampler='direct', steps=1")
+    elif sampler_name not in SAMPLERS:
+        raise ValueError(f"Unknown flow sampler {sampler_name!r}")
     with xr.open_dataset(input_path, engine="h5netcdf") as source:
         field = validate_converted_grid(source, derived, variable)
         indices = select_time_indices(
@@ -284,7 +312,7 @@ def run(settings: dict, device_name: str | None = None) -> Path:
                 f"expected {expected_days}"
             )
         attrs = {
-            "product": "ACCESS-CM2 SST downscaled by flow_sr",
+            "product": f"ACCESS-CM2 SST downscaled by {kind}",
             "period_name": settings["period_name"],
             "converted_input_path": str(input_path.resolve()),
             "converted_input_variable": variable,
@@ -318,16 +346,31 @@ def run(settings: dict, device_name: str | None = None) -> Path:
                     )
                 ).to(device)
                 batch_mask = mask.expand(len(batch_indices), -1, -1, -1)
-                noise = _make_noise(
-                    (len(batch_indices), 1, *derived.shape),
-                    device,
-                    condition.dtype,
-                    batch_mask,
-                    seed + batch_indices,
-                )
-                generated = get_sampler(sampler_name)(
-                    model, noise, condition, batch_mask, steps
-                )
+                if kind == "gan":
+                    noise = _make_gan_noise(
+                        (
+                            len(batch_indices),
+                            int(model_config.get("noise_channels", 4)),
+                            *derived.coarse_shape,
+                        ),
+                        device,
+                        condition.dtype,
+                        seed + batch_indices,
+                    )
+                    generated = model(
+                        condition, batch_mask, noise=noise
+                    )
+                else:
+                    noise = _make_noise(
+                        (len(batch_indices), 1, *derived.shape),
+                        device,
+                        condition.dtype,
+                        batch_mask,
+                        seed + batch_indices,
+                    )
+                    generated = get_sampler(sampler_name)(
+                        model, noise, condition, batch_mask, steps
+                    )
                 generated = generated.cpu().numpy()[:, 0]
                 generated = (
                     generated * float(normalization["sst_std"])
@@ -358,9 +401,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--period-name", required=True)
+    parser.add_argument("--run", type=Path, help="Override the trained run directory")
+    parser.add_argument("--output", type=Path, help="Override the output NetCDF path")
+    parser.add_argument("--sampler", help="Override sampler (use 'direct' for GANs)")
+    parser.add_argument("--sampler-steps", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--start", help="Override the inclusive period start")
+    parser.add_argument("--end", help="Override the inclusive period end")
+    parser.add_argument("--expected-days", type=int)
     parser.add_argument("--device", choices=("cpu", "cuda"))
     arguments = parser.parse_args()
-    run(load_settings(arguments.config, arguments.period_name), arguments.device)
+    settings = load_settings(arguments.config, arguments.period_name)
+    if arguments.run is not None:
+        settings["run_dir"] = arguments.run.resolve()
+    if arguments.output is not None:
+        settings["output"] = arguments.output.resolve()
+    if arguments.sampler is not None:
+        settings["sampler"] = arguments.sampler
+    if arguments.sampler_steps is not None:
+        settings["sampler_steps"] = arguments.sampler_steps
+    if arguments.batch_size is not None:
+        settings["batch_size"] = arguments.batch_size
+    if arguments.start is not None:
+        settings["start"] = arguments.start
+    if arguments.end is not None:
+        settings["end"] = arguments.end
+    if arguments.expected_days is not None:
+        settings["expected_days"] = arguments.expected_days
+    run(settings, arguments.device)
 
 
 if __name__ == "__main__":

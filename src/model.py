@@ -381,7 +381,8 @@ class AutoregressiveSuperResolutionFlowUNet(SuperResolutionFlowUNet):
         lag_base_channels: int = 16,
         lag_dropout: float = 0.10,
         lag_path_dropout: float = 0.10,
-        lag_guidance_scale: float = 0.25,
+        lag_guidance_scale: float = 1.0,
+        lag_conditioning: str = "full_state",
     ):
         super().__init__(
             base_channels=base_channels,
@@ -398,6 +399,12 @@ class AutoregressiveSuperResolutionFlowUNet(SuperResolutionFlowUNet):
             input_channels=target_channels + 1,
             levels=levels,
         )
+        if lag_conditioning not in ("full_state", "within_block_anomaly"):
+            raise ValueError(
+                "lag_conditioning must be 'full_state' or "
+                f"'within_block_anomaly', got {lag_conditioning!r}"
+            )
+        self.lag_conditioning = lag_conditioning
         self.fusion = nn.ModuleList(
             [
                 GatedFiLM(
@@ -424,14 +431,20 @@ class AutoregressiveSuperResolutionFlowUNet(SuperResolutionFlowUNet):
                 f"state {tuple(state.shape)}"
             )
         embedding = self.time(flow_time)
-        # The current coarse field is authoritative.  Remove the previous
-        # day's block means so the lag path can guide fronts and texture but
-        # cannot carry yesterday's large-scale SST forward by itself.
-        lag_anomaly = within_block_anomaly(
-            previous_state, ocean_mask, condition.shape[-2:]
-        )
+        # ``runs/flow_ar`` was trained before the coarse-authoritative revision
+        # and therefore consumed the complete previous state.  Keep that
+        # behaviour selectable: changing it after loading a checkpoint is a
+        # silent but severe model-definition change even though every parameter
+        # tensor still has the same shape.  New coarse-guided runs explicitly
+        # request the within-block anomaly pathway in their saved config.
+        if self.lag_conditioning == "within_block_anomaly":
+            lag_input = within_block_anomaly(
+                previous_state, ocean_mask, condition.shape[-2:]
+            )
+        else:
+            lag_input = previous_state
         lag_features = self.lag_encoder(
-            torch.cat((lag_anomaly, ocean_mask.expand_as(previous_state)), dim=1)
+            torch.cat((lag_input, ocean_mask.expand_as(previous_state)), dim=1)
         )
         hidden, skips = self.encode(
             state,
@@ -469,7 +482,11 @@ def build_model(config: dict) -> SuperResolutionFlowUNet:
             lag_base_channels=int(config.get("lag_base_channels", 16)),
             lag_dropout=float(config.get("lag_dropout", 0.10)),
             lag_path_dropout=float(config.get("lag_path_dropout", 0.10)),
-            lag_guidance_scale=float(config.get("lag_guidance_scale", 0.25)),
+            # Missing keys mean the legacy model definition.  In particular,
+            # ``runs/flow_ar/config_used.json`` predates both controls and must
+            # retain the full lag field and uncapped sigmoid gate at inference.
+            lag_guidance_scale=float(config.get("lag_guidance_scale", 1.0)),
+            lag_conditioning=str(config.get("lag_conditioning", "full_state")),
         )
     raise ValueError(f"Unknown model_kind {kind!r}")
 

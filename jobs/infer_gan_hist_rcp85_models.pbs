@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -N sst-gan-hist-rcp85-infer
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+
+runs=(
+  gan_sr_v2_hist_rcp85_continue_220k
+  gan_sr_v2b_hist_rcp85_continue_220k
+  gan_sr_v3_hist_rcp85_continue_220k
+)
+for name in "${runs[@]}"; do
+  run="runs/$name"
+  test "$(pixi run python -c "import json; print(json.load(open('$run/status.json'))['status'])")" = passed
+  pixi run -e gpu python -u src/evaluate.py \
+    --run "$run" --device cuda --all-samples --batch-size 32 --rollout-days 0
+  pixi run python -u src/validate_gan_inference.py --run "$run" --test
+
+  historical="$run/access_cm2_converted/historical_1980-01-01_1989-12-31_direct_gan.nc"
+  future="$run/access_cm2_converted/future_2080-01-01_2089-12-31_direct_gan.nc"
+  pixi run -e gpu python -u src/infer_access_cm2.py \
+    --config configs/access_cm2_inference.json --period-name historical \
+    --run "$run" --output "$historical" --sampler direct \
+    --sampler-steps 1 --batch-size 32 --device cuda
+  pixi run python -u src/validate_gan_inference.py \
+    --run "$run" --access-output "$historical" \
+    --start 1980-01-01 --end 1989-12-31
+  pixi run -e gpu python -u src/infer_access_cm2.py \
+    --config configs/access_cm2_inference.json --period-name future \
+    --run "$run" --output "$future" --sampler direct \
+    --sampler-steps 1 --batch-size 32 --device cuda
+  pixi run python -u src/validate_gan_inference.py \
+    --run "$run" --access-output "$future" \
+    --start 2080-01-01 --end 2089-12-31
+done

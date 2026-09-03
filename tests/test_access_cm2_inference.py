@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 import xarray as xr
 
 from infer_access_cm2 import (
+    _make_gan_noise,
     make_condition,
     select_time_indices,
     validate_converted_grid,
@@ -69,3 +71,13 @@ def test_condition_normalizes_then_zero_fills_and_appends_mask():
     assert np.all(condition[:, 0, 0, 0] == 0)
     assert np.all(condition[:, 1] == mask)
     np.testing.assert_allclose(condition[:, 0, 1, 1], (values[:, 1, 1] - 10) / 2)
+
+
+def test_gan_noise_is_batch_size_independent():
+    seeds = np.asarray([10, 20, 30])
+    together = _make_gan_noise((3, 2, 4, 5), "cpu", torch.float32, seeds)
+    separately = torch.cat([
+        _make_gan_noise((1, 2, 4, 5), "cpu", torch.float32, [seed])
+        for seed in seeds
+    ])
+    torch.testing.assert_close(together, separately)

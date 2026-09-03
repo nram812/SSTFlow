@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -N sst-combined-access
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=16:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+RUN=runs/flow_sr_combined_hist_rcp85_continue_320k
+CONFIG=configs/access_cm2_inference_combined_hist_rcp85.json
+python -c 'import json; state=json.load(open("runs/flow_sr_combined_hist_rcp85_continue_320k/status.json")); assert state["status"] == "passed" and state["step"] == 320000, state'
+pixi run python -u src/validate_flow_inference.py \
+  --run "$RUN" --test-product "$RUN/evaluation/full_test_samples_ab3_pc_75step.nc"
+for period in historical future; do
+  pixi run -e gpu python -u src/infer_access_cm2.py \
+    --config "$CONFIG" --period-name "$period" --device cuda
+  pixi run python -u src/validate_flow_inference.py \
+    --run "$RUN" --access-config "$CONFIG" --period-name "$period"
+done

@@ -45,6 +45,8 @@ _RELATIVE_PATH_KEYS = (
     "resume_from",
 )
 
+_RELATIVE_PATH_LIST_KEYS = ("source_paths",)
+
 
 # --------------------------------------------------------------------------
 # configuration
@@ -63,6 +65,13 @@ def load_config(path: str | Path) -> dict:
         config[key] = str(
             value if value.is_absolute() else REPOSITORY_ROOT / value
         )
+    for key in _RELATIVE_PATH_LIST_KEYS:
+        if key not in config:
+            continue
+        config[key] = [
+            str(value if (value := Path(item)).is_absolute() else REPOSITORY_ROOT / value)
+            for item in config[key]
+        ]
     config.setdefault("config_path", str(Path(path).resolve()))
     return config
 

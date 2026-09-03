@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compact multi-scale GAN for fine-detail SST super-resolution (PyTorch).
 
-Training alternates a masked hinge critic step with a generator step whose
-objective is
+Training alternates masked critic and generator steps.  The default objective
+is hinge GAN; ``adversarial_objective=wasserstein_gp`` selects a Wasserstein
+critic with real--fake interpolation gradient penalty.
 
 ``loss_G = pixel MSE + gradient + spectrum + feature matching + adversarial``
 
@@ -15,6 +16,7 @@ land can influence neither player.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import time
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from callbacks import (
     to_physical,
 )
 from common import load_config
+from consistency import coarse_consistency_mse
 from losses import (
     feature_matching_loss,
     hinge_discriminator_loss,
@@ -38,6 +41,8 @@ from losses import (
     masked_gradient_loss,
     masked_mse,
     spectral_amplitude_loss,
+    wasserstein_discriminator_loss,
+    wasserstein_generator_loss,
 )
 from model import parameter_count
 from model_gan import build_discriminator, build_generator
@@ -45,10 +50,81 @@ from model_gan import build_discriminator, build_generator
 DATASET_KIND = "super_resolution"
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_resume_checksum(config: dict) -> dict | None:
+    """Refuse to fork from weights other than the documented checkpoint."""
+    source = config.get("resume_from")
+    expected = config.get("resume_from_sha256")
+    if source is None or expected is None:
+        return None
+    path = Path(source)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    if not path.is_file():
+        raise FileNotFoundError(f"GAN resume checkpoint is missing: {path}")
+    actual = _sha256(path)
+    if actual != str(expected):
+        raise ValueError(f"GAN resume checksum differs: {actual} != {expected}")
+    return {"path": str(path.resolve()), "sha256": actual}
+
+
 def set_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
     """Freeze/unfreeze a player without blocking gradients to its inputs."""
     for parameter in module.parameters():
         parameter.requires_grad_(enabled)
+
+
+def wasserstein_gradient_penalty(
+    discriminator: torch.nn.Module,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    condition: torch.Tensor,
+    ocean_mask: torch.Tensor,
+    target_norm: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Standard WGAN-GP penalty for an ocean-masked PatchGAN critic.
+
+    A uniform coefficient samples the straight segment between each real and
+    generated field.  The discriminator already excludes invalid ocean
+    patches; its valid patch scores are averaged to one scalar per sample
+    before differentiating with respect to the high-resolution SST field.
+    Land gradients are identically zero because the critic masks its field
+    input internally.
+    """
+    if real.shape != fake.shape:
+        raise ValueError(f"real/fake shapes differ: {real.shape} != {fake.shape}")
+    if target_norm <= 0:
+        raise ValueError("gradient-penalty target norm must be positive")
+    alpha = torch.rand(
+        (real.shape[0], 1, 1, 1),
+        device=real.device,
+        dtype=real.dtype,
+        generator=generator,
+    )
+    interpolated = (
+        real.detach() + alpha * (fake.detach() - real.detach())
+    ).requires_grad_(True)
+    logits = discriminator(interpolated, condition, ocean_mask)
+    sample_scores = logits.mean(dim=1)
+    gradients = torch.autograd.grad(
+        outputs=sample_scores,
+        inputs=interpolated,
+        grad_outputs=torch.ones_like(sample_scores),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradient_norm = gradients.flatten(1).square().sum(dim=1).add(1.0e-12).sqrt()
+    penalty = (gradient_norm - float(target_norm)).square().mean()
+    return penalty, gradient_norm
 
 
 @torch.no_grad()
@@ -61,6 +137,9 @@ def validation_metrics(
     generator = torch.Generator(device=device).manual_seed(seed)
     generated = generator_module(batch["condition"], batch["mask"], generator=generator)
     content = float(masked_mse(generated, batch["target"], batch["mask"]))
+    consistency = float(
+        coarse_consistency_mse(generated, batch["condition"], batch["mask"])
+    )
     metrics = field_metrics(
         to_physical(generated, normalization, derived.ocean_mask)[:, 0],
         to_physical(batch["target"], normalization, derived.ocean_mask)[:, 0],
@@ -68,6 +147,7 @@ def validation_metrics(
     generator_module.train()
     return {
         "content_mse_normalized": content,
+        "coarse_consistency_mse_normalized": consistency,
         "samples": int(len(indices)),
         **metrics,
     }
@@ -146,6 +226,7 @@ def train(
     train_dataset, validation_dataset = engine.make_datasets(
         config, normalization, derived, is_smoke, DATASET_KIND
     )
+    resume_provenance = validate_resume_checksum(config)
 
     generator_module = build_generator(config).to(device)
     discriminator = build_discriminator(config).to(device)
@@ -154,19 +235,31 @@ def train(
     )
     ema.module.to(device)
 
+    active_learning_rate = float(
+        config.get("continuation_learning_rate", config["learning_rate"])
+    )
+    active_discriminator_learning_rate = float(
+        config.get(
+            "continuation_discriminator_learning_rate",
+            config.get("continuation_learning_rate", config.get(
+                "discriminator_learning_rate", config["learning_rate"]
+            )),
+        )
+    )
     generator_optimizer = torch.optim.AdamW(
         generator_module.parameters(),
-        lr=float(config["learning_rate"]),
+        lr=active_learning_rate,
         weight_decay=float(config.get("weight_decay", 1.0e-5)),
         betas=tuple(config.get("generator_betas", (0.0, 0.99))),
     )
     discriminator_optimizer = torch.optim.AdamW(
         discriminator.parameters(),
-        lr=float(config.get("discriminator_learning_rate", config["learning_rate"])),
+        lr=active_discriminator_learning_rate,
         weight_decay=float(config.get("weight_decay", 1.0e-5)),
         betas=tuple(config.get("discriminator_betas", (0.0, 0.99))),
     )
     generator_scheduler = engine.build_scheduler(generator_optimizer, config)
+    discriminator_scheduler = engine.build_scheduler(discriminator_optimizer, config)
 
     modules = {
         "generator": generator_module,
@@ -177,8 +270,25 @@ def train(
         "generator": generator_optimizer,
         "discriminator": discriminator_optimizer,
     }
+    schedulers = {
+        "generator": generator_scheduler,
+        "discriminator": discriminator_scheduler,
+    }
     step, history, validation = engine.restore_training_state(
-        output_dir, modules, optimizers, {"generator": generator_scheduler}, device
+        output_dir,
+        modules,
+        optimizers,
+        schedulers,
+        device,
+        resume_from=config.get("resume_from"),
+        continuation_learning_rate=(
+            active_learning_rate
+            if "continuation_learning_rate" in config
+            else None
+        ),
+        reset_optimizers_on_external_fork=bool(
+            config.get("reset_optimizers_on_external_fork", False)
+        ),
     )
 
     max_steps = int(smoke_steps or config["max_steps"])
@@ -199,6 +309,16 @@ def train(
     lambda_spectral = float(config.get("lambda_spectral", 0.0))
     lambda_feature = float(config.get("lambda_feature_matching", 0.0))
     critic_steps = max(int(config.get("critic_steps", 1)), 1)
+    adversarial_objective = str(config.get("adversarial_objective", "hinge"))
+    if adversarial_objective not in ("hinge", "wasserstein_gp"):
+        raise ValueError(
+            "adversarial_objective must be 'hinge' or 'wasserstein_gp', got "
+            f"{adversarial_objective!r}"
+        )
+    gradient_penalty_weight = float(config.get("gradient_penalty_weight", 10.0))
+    gradient_penalty_target = float(config.get("gradient_penalty_target", 1.0))
+    if adversarial_objective == "wasserstein_gp" and gradient_penalty_weight <= 0:
+        raise ValueError("WGAN-GP requires gradient_penalty_weight > 0")
     adversarial_start = (
         0 if is_smoke else int(config.get("adversarial_start_step", 2000))
     )
@@ -221,6 +341,12 @@ def train(
 
         # ---- critic ----------------------------------------------------
         if adversarial:
+            critic_losses = []
+            critic_costs = []
+            penalty_values = []
+            penalty_norms = []
+            real_scores = []
+            fake_scores = []
             for _ in range(critic_steps):
                 batch = engine.batch_to_device(next(batches), device)
                 with torch.no_grad():
@@ -229,18 +355,53 @@ def train(
                     batch["target"], batch["condition"], batch["mask"]
                 )
                 fake_logits = discriminator(fake, batch["condition"], batch["mask"])
-                critic_loss = hinge_discriminator_loss(real_logits, fake_logits)
+                if adversarial_objective == "wasserstein_gp":
+                    critic_cost = wasserstein_discriminator_loss(
+                        real_logits, fake_logits
+                    )
+                    gradient_penalty, gradient_norm = wasserstein_gradient_penalty(
+                        discriminator,
+                        batch["target"],
+                        fake,
+                        batch["condition"],
+                        batch["mask"],
+                        target_norm=gradient_penalty_target,
+                    )
+                    critic_loss = (
+                        critic_cost + gradient_penalty_weight * gradient_penalty
+                    )
+                    critic_costs.append(float(critic_cost.detach()))
+                    penalty_values.append(float(gradient_penalty.detach()))
+                    penalty_norms.append(float(gradient_norm.detach().mean()))
+                else:
+                    critic_loss = hinge_discriminator_loss(real_logits, fake_logits)
                 engine.check_finite(critic_loss, step, "critic loss")
                 critic_loss.backward()
-                engine.clip_and_step(
+                critic_gradient_norm = engine.clip_and_step(
                     discriminator,
                     discriminator_optimizer,
                     step,
                     float(config.get("gradient_clip", 1.0)),
                 )
-            record["critic"] = float(critic_loss.detach())
-            record["real_logit"] = float(real_logits.detach().mean())
-            record["fake_logit"] = float(fake_logits.detach().mean())
+                critic_losses.append(float(critic_loss.detach()))
+                real_scores.append(float(real_logits.detach().mean()))
+                fake_scores.append(float(fake_logits.detach().mean()))
+            discriminator_scheduler.step()
+            record["critic"] = float(np.mean(critic_losses))
+            record["critic_steps"] = critic_steps
+            record["critic_gradient_norm"] = critic_gradient_norm
+            record["discriminator_learning_rate"] = float(
+                discriminator_scheduler.get_last_lr()[0]
+            )
+            record["real_logit"] = float(np.mean(real_scores))
+            record["fake_logit"] = float(np.mean(fake_scores))
+            if adversarial_objective == "wasserstein_gp":
+                record["wasserstein_critic_cost"] = float(np.mean(critic_costs))
+                record["wasserstein_estimate"] = float(
+                    np.mean(real_scores) - np.mean(fake_scores)
+                )
+                record["gradient_penalty"] = float(np.mean(penalty_values))
+                record["gradient_penalty_norm"] = float(np.mean(penalty_norms))
 
         # ---- generator -------------------------------------------------
         batch = engine.batch_to_device(next(batches), device)
@@ -263,6 +424,7 @@ def train(
             # in place contaminates the next critic update with the opposite
             # objective and drives both real/fake logits upward.
             set_requires_grad(discriminator, False)
+            discriminator.eval()
             fake_logits, fake_features, feature_masks = discriminator(
                 generated, batch["condition"], batch["mask"], return_features=True
             )
@@ -271,7 +433,11 @@ def train(
                     batch["target"], batch["condition"], batch["mask"],
                     return_features=True,
                 )
-            adversarial_loss = hinge_generator_loss(fake_logits)
+            adversarial_loss = (
+                wasserstein_generator_loss(fake_logits)
+                if adversarial_objective == "wasserstein_gp"
+                else hinge_generator_loss(fake_logits)
+            )
             engine.check_finite(adversarial_loss, step, "adversarial loss")
             loss = loss + lambda_adversarial * adversarial_loss
             record["adversarial_loss"] = float(adversarial_loss.detach())
@@ -291,6 +457,7 @@ def train(
         )
         if adversarial:
             set_requires_grad(discriminator, True)
+            discriminator.train()
             discriminator_optimizer.zero_grad(set_to_none=True)
         generator_scheduler.step()
         ema.update(generator_module)
@@ -339,7 +506,10 @@ def train(
             save_loss_curve(
                 history,
                 output_dir / "predictions" / f"loss_curve_step_{step:06d}.png",
-                keys=("total", "content", "gradient", "spectral", "critic"),
+                keys=(
+                    "total", "content", "gradient", "spectral", "critic",
+                    "gradient_penalty", "wasserstein_estimate",
+                ),
             )
 
         if engine.should_run(step, int(config.get("checkpoint_every", 2000))):
@@ -348,7 +518,7 @@ def train(
                 step,
                 modules,
                 optimizers,
-                {"generator": generator_scheduler},
+                schedulers,
                 history,
                 validation,
                 config,
@@ -363,7 +533,7 @@ def train(
         step,
         modules,
         optimizers,
-        {"generator": generator_scheduler},
+        schedulers,
         history,
         validation,
         config,
@@ -396,10 +566,20 @@ def train(
             "adversarial_exercised": any(
                 record.get("adversarial") for record in history
             ),
+            "adversarial_objective": adversarial_objective,
+            "critic_steps": critic_steps,
+            "gradient_penalty_weight": (
+                gradient_penalty_weight
+                if adversarial_objective == "wasserstein_gp" else 0.0
+            ),
+            "resume_provenance": resume_provenance,
             "final_loss": float(np.mean([r["total"] for r in history[-50:]]))
             if history
             else None,
-            "loss_keys": ("total", "content", "critic"),
+            "loss_keys": (
+                "total", "content", "critic", "gradient_penalty",
+                "wasserstein_estimate",
+            ),
         },
         started,
     )
@@ -413,10 +593,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke-steps", type=int)
+    parser.add_argument(
+        "--smoke-output-dir",
+        help="Optional isolated output directory for this smoke run",
+    )
     parser.add_argument("--device", choices=("cpu", "cuda"))
     arguments = parser.parse_args()
+    config = load_config(arguments.config)
+    if arguments.smoke_output_dir:
+        if arguments.smoke_steps is None:
+            parser.error("--smoke-output-dir requires --smoke-steps")
+        config["smoke_output_dir"] = arguments.smoke_output_dir
     train(
-        load_config(arguments.config),
+        config,
         smoke_steps=arguments.smoke_steps,
         device_name=arguments.device,
     )

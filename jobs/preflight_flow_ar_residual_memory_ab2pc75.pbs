@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -N sst-ar-mem-preflight
+#PBS -q h200q
+#PBS -l select=1:ncpus=8:mem=96GB:ngpus=1
+#PBS -l walltime=00:30:00
+#PBS -j oe
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib-flow-ar-memory-preflight"
+mkdir -p "$MPLCONFIGDIR"
+
+RUN=runs/flow_ar_residual_memory
+python -c 'import json; state=json.load(open("runs/flow_ar_residual_memory/status.json")); assert state["status"] == "passed" and state["step"] == 120000, state'
+OUTPUT="$RUN/evaluation/preflight_common_noise_ab2pc75_5day.nc"
+test ! -e "$OUTPUT"
+
+pixi run -e gpu python -u src/run_flow_ar_rollout.py \
+  --run "$RUN" \
+  --initial-date 2011-01-01 \
+  --end-date 2011-01-06 \
+  --output "$OUTPUT" \
+  --sampler ab2_pc \
+  --sampler-steps 75 \
+  --noise-correlation 1.0 \
+  --seed 2020 \
+  --device cuda
+
+pixi run -e gpu python -u src/validate_flow_ar_rollout.py \
+  --input "$OUTPUT" \
+  --initial-date 2011-01-01 \
+  --end-date 2011-01-06 \
+  --sampler ab2_pc \
+  --sampler-steps 75 \
+  --expected-lag-conditioning within_block_anomaly \
+  --expected-lag-guidance-scale 0.15 \
+  --expected-noise-correlation 1.0

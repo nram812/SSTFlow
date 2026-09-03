@@ -5,8 +5,8 @@ import torch
 
 from compare_flow_solvers import model_evaluations
 
-from flow import (ab2_sample, ab3_pc_sample, euler_sample, flow_matching_loss, get_sampler,
-                  heun_sample, masked_noise, rollout, sample,
+from flow import (ab2_pc_sample, ab2_sample, ab3_pc_sample, euler_sample,
+                  flow_matching_loss, get_sampler, heun_sample, masked_noise, rollout, sample,
                   single_step_rollout_loss)
 from model import AutoregressiveSuperResolutionFlowUNet, SuperResolutionFlowUNet
 
@@ -46,7 +46,9 @@ def test_loss_is_finite_and_gradient_flows(ar):
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
-@pytest.mark.parametrize("sampler", [euler_sample, heun_sample, ab2_sample, ab3_pc_sample])
+@pytest.mark.parametrize(
+    "sampler", [euler_sample, heun_sample, ab2_sample, ab2_pc_sample, ab3_pc_sample]
+)
 @pytest.mark.parametrize("steps", [1, 2, 5, 50])
 def test_samplers_shape_finite_and_land(sampler, steps):
     target, condition, mask = inputs(); result = sampler(ConstantVelocity(), target, condition, mask, steps)
@@ -64,6 +66,43 @@ def test_sampler_determinism_with_seed():
 def test_heun_matches_constant_velocity():
     target, condition, mask = inputs(); initial = torch.zeros_like(target)
     torch.testing.assert_close(heun_sample(ConstantVelocity(), initial, condition, mask, 5), mask)
+
+
+def test_ab2_pc_matches_constant_velocity_and_uses_two_evaluations_per_step():
+    class CountingVelocity(ConstantVelocity):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, *args):
+            self.calls += 1
+            return super().forward(*args)
+
+    target, condition, mask = inputs()
+    model = CountingVelocity()
+    result = ab2_pc_sample(model, torch.zeros_like(target), condition, mask, 7)
+    torch.testing.assert_close(result, mask)
+    assert model.calls == 14
+
+
+def test_ab2_pc_is_second_order_for_linear_ode_and_resets_history():
+    class ExponentialVelocity(torch.nn.Module):
+        def forward(self, state, condition, mask, flow_time, *args):
+            return state * mask
+
+    target, condition, mask = inputs()
+    initial = torch.ones_like(target) * mask
+    model = ExponentialVelocity()
+    # The one-step Heun startup has a small pre-asymptotic cancellation at very
+    # coarse resolution; 20/40 steps exercises the expected second-order regime.
+    coarse = ab2_pc_sample(model, initial, condition, mask, 20)
+    fine = ab2_pc_sample(model, initial, condition, mask, 40)
+    exact = math.e * mask
+    coarse_error = torch.mean(torch.abs(coarse[mask.bool()] - exact[mask.bool()]))
+    fine_error = torch.mean(torch.abs(fine[mask.bool()] - exact[mask.bool()]))
+    assert fine_error < 0.35 * coarse_error
+    repeated = ab2_pc_sample(model, initial, condition, mask, 40)
+    torch.testing.assert_close(fine, repeated, rtol=0, atol=0)
 
 
 def test_ab3_pc_matches_constant_velocity_and_uses_two_evaluations_per_step():

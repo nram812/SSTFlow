@@ -57,6 +57,16 @@ class DerivedProduct:
                 np.float32
             )
             self.sst_lr = dataset["sst_lr"].values.astype(np.float32)
+            self.source_id = (
+                dataset["source_id"].values.astype(np.int16)
+                if "source_id" in dataset
+                else np.zeros(len(self.times), dtype=np.int16)
+            )
+            self.source_index = (
+                dataset["source_index"].values.astype(np.int64)
+                if "source_index" in dataset
+                else np.arange(len(self.times), dtype=np.int64)
+            )
             self.attrs = dict(dataset.attrs)
         self.coarsen_factor = int(self.attrs["coarsen_factor"])
 
@@ -91,6 +101,12 @@ class DerivedProduct:
                 f"{int((~finite).sum())} non-finite coarse values inside the "
                 "coarse ocean mask"
             )
+        if len(self.source_id) != len(self.times) or len(self.source_index) != len(
+            self.times
+        ):
+            raise ValueError("Source mapping length differs from the derived time axis")
+        if np.any(self.source_id < 0) or np.any(self.source_index < 0):
+            raise ValueError("Source mapping contains negative indices")
 
 
 class _SourceReader:
@@ -138,6 +154,40 @@ class _SourceReader:
             self._handle = None
 
 
+class _MultiSourceReader:
+    """Map a derived concatenated time axis onto multiple immutable raw files."""
+
+    def __init__(self, paths, source_id: np.ndarray, source_index: np.ndarray):
+        self.readers = [_SourceReader(path) for path in paths]
+        self.source_id = np.asarray(source_id, dtype=np.int16)
+        self.source_index = np.asarray(source_index, dtype=np.int64)
+        if not self.readers:
+            raise ValueError("At least one source file is required")
+        if self.source_id.max(initial=0) >= len(self.readers):
+            raise ValueError("Derived source_id refers to an unconfigured source file")
+
+    def read(self, indices) -> np.ndarray:
+        indices = np.atleast_1d(np.asarray(indices, dtype=np.int64))
+        if np.any(indices < 0) or np.any(indices >= len(self.source_id)):
+            raise IndexError("Derived source index is out of bounds")
+        result = None
+        ids = self.source_id[indices]
+        local = self.source_index[indices]
+        for source in np.unique(ids):
+            positions = np.flatnonzero(ids == source)
+            block = self.readers[int(source)].read(local[positions])
+            if result is None:
+                result = np.empty((len(indices), *block.shape[1:]), dtype=np.float32)
+            result[positions] = block
+        if result is None:
+            raise ValueError("Cannot read an empty index collection")
+        return result
+
+    def close(self) -> None:
+        for reader in self.readers:
+            reader.close()
+
+
 class SuperResolutionDataset(Dataset):
     """One sample per day: coarse predictor plus high-resolution target."""
 
@@ -162,7 +212,12 @@ class SuperResolutionDataset(Dataset):
 
         self.times = self.derived.times
         self.indices = selected_indices(self.times, date_ranges)
-        self.reader = _SourceReader(config["source_path"])
+        source_paths = config.get("source_paths", [config.get("source_path")])
+        if any(path is None for path in source_paths):
+            raise ValueError("Configure source_path or source_paths")
+        self.reader = _MultiSourceReader(
+            source_paths, self.derived.source_id, self.derived.source_index
+        )
 
         self.ocean_mask = self.derived.ocean_mask
         self.ocean_mask_lr = self.derived.ocean_mask_lr

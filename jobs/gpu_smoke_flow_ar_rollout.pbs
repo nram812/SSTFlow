@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N sst-flow-ar-rollout-smoke
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib-flow-ar-smoke"
+mkdir -p "$MPLCONFIGDIR"
+
+pixi run -e gpu python -u jobs/gpu_smoke_flow_ar_rollout.py
+pixi run -e gpu python -u src/validate_flow_ar_rollout.py \
+  --input runs/flow_ar/evaluation/preflight_ab2pc75_5day.nc \
+  --initial-date 2011-01-01 \
+  --end-date 2011-01-06 \
+  --sampler ab2_pc \
+  --sampler-steps 75

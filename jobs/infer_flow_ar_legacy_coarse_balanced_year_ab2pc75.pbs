@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -N sst-ar-mid-year
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib-flow-ar-mid-year"
+mkdir -p "$MPLCONFIGDIR"
+
+RUN=runs/flow_ar_legacy_coarse_balanced
+python -c 'import json; state=json.load(open("runs/flow_ar_legacy_coarse_balanced/status.json")); assert state["status"] == "passed" and state["step"] == 120000, state'
+
+PREFLIGHT="$RUN/evaluation/preflight_common_noise_ab2pc75_5day.nc"
+if [[ ! -e "$PREFLIGHT" ]]; then
+  pixi run -e gpu python -u src/run_flow_ar_rollout.py \
+    --run "$RUN" --initial-date 2011-01-01 --end-date 2011-01-06 \
+    --output "$PREFLIGHT" --sampler ab2_pc --sampler-steps 75 \
+    --noise-correlation 1.0 --seed 2020 --device cuda
+fi
+pixi run python -u src/validate_flow_ar_rollout.py \
+  --input "$PREFLIGHT" --initial-date 2011-01-01 --end-date 2011-01-06 \
+  --sampler ab2_pc --sampler-steps 75 \
+  --expected-lag-conditioning full_state \
+  --expected-lag-guidance-scale 0.35 \
+  --expected-noise-correlation 1.0
+
+OUTPUT="$RUN/evaluation/test_2011_common_noise_free_rollout_ab2pc_75step.nc"
+if [[ ! -e "$OUTPUT" ]]; then
+  pixi run -e gpu python -u src/run_flow_ar_rollout.py \
+    --run "$RUN" --initial-date 2011-01-01 --end-date 2011-12-31 \
+    --output "$OUTPUT" --sampler ab2_pc --sampler-steps 75 \
+    --noise-correlation 1.0 --seed 2020 --device cuda
+fi
+pixi run python -u src/validate_flow_ar_rollout.py \
+  --input "$OUTPUT" --initial-date 2011-01-01 --end-date 2011-12-31 \
+  --sampler ab2_pc --sampler-steps 75 \
+  --expected-lag-conditioning full_state \
+  --expected-lag-guidance-scale 0.35 \
+  --expected-noise-correlation 1.0

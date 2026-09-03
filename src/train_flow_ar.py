@@ -14,6 +14,7 @@ day projected onto that day's authoritative coarse ocean-block means.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import time
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from callbacks import (
     save_rollout_skill_plot,
     to_physical,
 )
-from common import load_config
+from common import atomic_json, load_config
 from consistency import coarse_consistency_mse
 from flow import (
     flow_matching_loss,
@@ -42,6 +43,113 @@ from losses import masked_mse
 from model import build_model, parameter_count
 
 DATASET_KIND = "autoregressive"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def initialize_from_plain_flow(model, config: dict, output_dir: Path) -> dict:
+    """Initialize from a plain-flow backbone or a complete AR EMA.
+
+    A local AR checkpoint always wins.  For a new run, strict partial loading
+    from plain Flow-SR permits only the new lag encoder and fusion modules to be
+    absent.  A legacy-AR fine-tune instead requires every tensor to match
+    exactly; non-parameter controls such as the FiLM cap and lag-path dropout
+    are intentionally supplied by the new config.
+    """
+    if (output_dir / "checkpoint.pt").is_file():
+        return {"mode": "local_resume"}
+    plain_source = config.get("pretrained_flow_ema_path")
+    ar_source = config.get("pretrained_ar_ema_path")
+    if plain_source is not None and ar_source is not None:
+        raise ValueError(
+            "configure only one of pretrained_flow_ema_path and "
+            "pretrained_ar_ema_path"
+        )
+    if ar_source is not None:
+        source_path = Path(ar_source)
+        if not source_path.is_absolute():
+            source_path = Path(__file__).resolve().parents[1] / source_path
+        if not source_path.is_file():
+            raise FileNotFoundError(f"pretrained AR EMA is missing: {source_path}")
+        checksum = _sha256(source_path)
+        expected = config.get("pretrained_ar_ema_sha256")
+        if expected is not None and checksum != str(expected):
+            raise ValueError(
+                f"pretrained AR checksum differs: {checksum} != {expected}"
+            )
+        state = torch.load(source_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=True)
+        return {
+            "mode": "complete_autoregressive_ema",
+            "source": str(source_path.resolve()),
+            "source_sha256": checksum,
+            "loaded_tensors": len(state),
+        }
+
+    source = plain_source
+    if source is None:
+        return {"mode": "scratch"}
+    source_path = Path(source)
+    if not source_path.is_absolute():
+        source_path = Path(__file__).resolve().parents[1] / source_path
+    if not source_path.is_file():
+        raise FileNotFoundError(f"pretrained plain-flow EMA is missing: {source_path}")
+    checksum = _sha256(source_path)
+    expected = config.get("pretrained_flow_ema_sha256")
+    if expected is not None and checksum != str(expected):
+        raise ValueError(
+            f"pretrained plain-flow checksum differs: {checksum} != {expected}"
+        )
+    state = torch.load(source_path, map_location="cpu", weights_only=True)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    allowed_prefixes = ("lag_encoder.", "fusion.")
+    rejected_missing = [
+        name for name in missing if not name.startswith(allowed_prefixes)
+    ]
+    if unexpected or rejected_missing or not missing:
+        raise ValueError(
+            "plain-flow EMA is not an exact shared-backbone initialization: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        "mode": "plain_flow_ema_backbone",
+        "source": str(source_path.resolve()),
+        "source_sha256": checksum,
+        "new_parameter_prefixes": list(allowed_prefixes),
+        "missing_new_tensors": len(missing),
+    }
+
+
+def configure_trainable_policy(model, config: dict) -> dict:
+    """Select all parameters or only bounded residual-memory modules."""
+    policy = str(config.get("trainable_policy", "all"))
+    if policy == "all":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    elif policy == "lag_only":
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for module in (model.lag_encoder, model.fusion):
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
+    else:
+        raise ValueError(f"unknown AR trainable_policy {policy!r}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    if trainable == 0:
+        raise ValueError("AR trainable policy selected no parameters")
+    return {
+        "trainable_policy": policy,
+        "trainable_parameters": trainable,
+        "frozen_parameters": frozen,
+        "trainable_fraction": trainable / (trainable + frozen),
+    }
 
 
 @torch.no_grad()
@@ -214,6 +322,9 @@ def free_running_rollout(
             enforce_coarse_consistency=bool(
                 config.get("enforce_coarse_consistency", True)
             ),
+            noise_correlation=float(
+                config.get("rollout_noise_correlation", 0.0)
+            ),
         )[0]
         targets = batch["targets"][0]
         generated_physical = to_physical(
@@ -268,6 +379,9 @@ def free_running_rollout(
             "generated_mean_abs_daily_change": generated_evolution,
             "target_mean_abs_daily_change": target_evolution,
             "evolution_ratio": generated_evolution / max(target_evolution, 1.0e-12),
+            "noise_correlation": float(
+                config.get("rollout_noise_correlation", 0.0)
+            ),
         }
         model.train()
         return metrics
@@ -291,11 +405,14 @@ def train(
         config, normalization, derived, is_smoke, DATASET_KIND
     )
 
-    model = build_model(config).to(device)
+    model = build_model(config)
+    initialization = initialize_from_plain_flow(model, config, output_dir)
+    parameter_policy = configure_trainable_policy(model, config)
+    model = model.to(device)
     ema = engine.ExponentialMovingAverage(model, float(config.get("ema_decay", 0.999)))
     ema.module.to(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=float(config["learning_rate"]),
         weight_decay=float(config.get("weight_decay", 1.0e-5)),
         betas=(0.9, 0.99),
@@ -304,6 +421,25 @@ def train(
     modules = {"model": model, "model_ema": ema}
     step, history, validation = engine.restore_training_state(
         output_dir, modules, {"model": optimizer}, {"model": scheduler}, device
+    )
+    atomic_json(
+        output_dir / "memory_contract.json",
+        {
+            "initialization": initialization,
+            **parameter_policy,
+            "lag_conditioning": str(config.get("lag_conditioning", "full_state")),
+            "lag_guidance_scale": float(config.get("lag_guidance_scale", 1.0)),
+            "lag_path_dropout": float(config.get("lag_path_dropout", 0.1)),
+            "enforce_coarse_consistency": bool(
+                config.get("enforce_coarse_consistency", True)
+            ),
+            "interpretation": (
+                "frozen plain-flow backbone plus a bounded correction from the "
+                "previous day's within-block SST anomaly"
+                if parameter_policy["trainable_policy"] == "lag_only"
+                else "jointly trained autoregressive flow"
+            ),
+        },
     )
 
     max_steps = int(smoke_steps or config["max_steps"])
@@ -468,6 +604,7 @@ def train(
         {
             "smoke_test": is_smoke,
             "parameters": parameter_count(model),
+            **parameter_policy,
             "training_pairs": len(train_dataset),
             "rollout_training_loss": False,
             "rollout_diagnostic": smoke_rollout_metrics,

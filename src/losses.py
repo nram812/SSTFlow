@@ -147,3 +147,20 @@ def hinge_discriminator_loss(
 
 def hinge_generator_loss(fake_logits: torch.Tensor) -> torch.Tensor:
     return -fake_logits.mean()
+
+
+def wasserstein_discriminator_loss(
+    real_logits: torch.Tensor, fake_logits: torch.Tensor
+) -> torch.Tensor:
+    """Wasserstein critic cost minimized by the discriminator.
+
+    Lowering this quantity raises the mean real score and lowers the mean fake
+    score.  A Lipschitz constraint such as gradient penalty is required; this
+    cost alone is not a complete WGAN objective.
+    """
+    return fake_logits.mean() - real_logits.mean()
+
+
+def wasserstein_generator_loss(fake_logits: torch.Tensor) -> torch.Tensor:
+    """Generator cost for a Wasserstein critic."""
+    return -fake_logits.mean()

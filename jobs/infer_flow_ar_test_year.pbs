@@ -1,0 +1,8 @@
+#!/bin/bash
+# Retired launcher retained only to make the earlier failure explicit.
+set -euo pipefail
+
+echo "This launcher is retired: it used the generic evaluator, changed the" >&2
+echo "saved checkpoint's lag semantics, and failed during rollout assembly." >&2
+echo "Use jobs/infer_flow_ar_test_year_ab2pc75.pbs after the H200 smoke gate." >&2
+exit 2

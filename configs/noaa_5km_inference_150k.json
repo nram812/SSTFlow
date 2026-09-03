@@ -1,0 +1,27 @@
+{
+  "name": "noaa_5km_150k_ab3pc75",
+  "description": "Full NOAA test and two ten-year ACCESS-CM2 inferences from the completed 150000-step NOAA EMA",
+  "run_dir": "runs/flow_sr_noaa_5km_decoder_continue_150k",
+  "input_path": "derived/sst_downscaling_access_converted.nc",
+  "variable": "sst_lr",
+  "sampler": "ab3_pc",
+  "sampler_steps": 75,
+  "batch_size": 4,
+  "seed": 42,
+  "expected_test_days": 1094,
+  "output": "runs/flow_sr_noaa_5km_decoder_continue_150k/evaluation/full_test_samples_ab3_pc_75step.nc",
+  "periods": {
+    "historical": {
+      "start": "1980-01-01",
+      "end": "1989-12-31",
+      "expected_days": 3653,
+      "output": "runs/flow_sr_noaa_5km_decoder_continue_150k/access_cm2_converted/historical_1980-01-01_1989-12-31_ab3pc_75step.nc"
+    },
+    "future": {
+      "start": "2080-01-01",
+      "end": "2089-12-31",
+      "expected_days": 3653,
+      "output": "runs/flow_sr_noaa_5km_decoder_continue_150k/access_cm2_converted/future_2080-01-01_2089-12-31_ab3pc_75step.nc"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+#!/bin/bash
+#PBS -N sst-gan-combined-smoke
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+pixi run -e gpu python -u jobs/gpu_smoke_gan_hist_rcp85.py

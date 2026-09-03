@@ -76,6 +76,32 @@ def evaluation_indices(dataset, samples: int | None) -> np.ndarray:
     return engine.fixed_indices(dataset, samples)
 
 
+def rollout_inputs(items: list[dict], device: torch.device):
+    """Batch a sequence of AR items for ``flow.rollout``.
+
+    Dataset items carry one condition as ``(channels, lat, lon)``.  The
+    rollout API additionally needs a batch axis, so stacking on axis zero and
+    adding a leading singleton dimension produces
+    ``(batch=1, lead, channels, lat, lon)``.  Keeping this conversion in one
+    small helper prevents the easy-to-miss ``(lead, channels, ...)`` shape bug.
+    """
+    if not items:
+        raise ValueError("At least one item is required for an AR rollout")
+    conditions = torch.stack([item["condition"] for item in items], dim=0)
+    conditions = conditions.unsqueeze(0).to(device)
+    mask = items[0]["mask"][None].to(device)
+    previous = items[0]["previous"][None].to(device)
+    return previous, conditions, mask
+
+
+def target_dates(dataset, items) -> list[str]:
+    """Dates of prediction targets, including for autoregressive pairs."""
+    indices = np.atleast_1d(np.asarray(items, dtype=np.int64))
+    if hasattr(dataset, "starts"):
+        return [dataset.date_window(int(index))[-1] for index in indices]
+    return dataset.dates(indices)
+
+
 def evaluate(run_dir: Path, device_name: str | None = None, samples: int | None = 32,
              batch_size: int = 4, sampler_steps: list[int] | None = None,
              rollout_days: int = 10, sampler: str | None = None) -> dict:
@@ -105,7 +131,7 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int | None 
             generated_all.append(engine_to_physical(generated, normalization, derived.ocean_mask))
             target_all.append(engine_to_physical(batch["target"], normalization, derived.ocean_mask))
             coarse_all.append(coarse_to_physical(batch["condition"], normalization, derived.ocean_mask_lr))
-            dates.extend(dataset.dates(chosen))
+            dates.extend(target_dates(dataset, chosen))
         generated_np = np.concatenate(generated_all)[:, 0]
         target_np = np.concatenate(target_all)[:, 0]
         coarse_np = np.concatenate(coarse_all)
@@ -122,7 +148,11 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int | None 
     output_dir = run_dir / "evaluation"
     output_dir.mkdir(parents=True, exist_ok=True)
     generated_np, target_np, coarse_np, dates = saved
-    selected_sampler = sampler or config.get("sampler", "heun")
+    selected_sampler = (
+        "direct"
+        if config.get("model_kind") == "gan"
+        else sampler or config.get("sampler", "heun")
+    )
     suffix = f"_{selected_sampler}_{int(step_values[-1])}step" if sampler else ""
     product_name = (
         f"full_test_samples{suffix}.nc" if full_test else f"test_samples{suffix}.nc"
@@ -138,13 +168,17 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int | None 
     if config.get("model_kind") == "autoregressive" and rollout_days > 0:
         length = min(rollout_days, len(dataset))
         items = [dataset[index] for index in range(length)]
-        conditions = torch.stack([item["condition"] for item in items], dim=1).to(device)
-        mask = items[0]["mask"][None].to(device)
-        previous = items[0]["previous"][None].to(device)
+        previous, conditions, mask = rollout_inputs(items, device)
         generator = torch.Generator(device=device).manual_seed(int(config.get("seed", 42)))
+        rollout_steps = int(
+            sampler_steps[-1]
+            if sampler_steps
+            else config.get("rollout_sampler_steps", 25)
+        )
+        rollout_sampler = sampler or config.get("sampler", "heun")
         generated = rollout(model, previous, conditions, mask,
-                            int(config.get("rollout_sampler_steps", 25)),
-                            config.get("sampler", "heun"), generator,
+                            rollout_steps,
+                            rollout_sampler, generator,
                             enforce_coarse_consistency=bool(
                                 config.get("enforce_coarse_consistency", False)
                             ))[0]
@@ -152,9 +186,16 @@ def evaluate(run_dir: Path, device_name: str | None = None, samples: int | None 
         generated_physical = engine_to_physical(generated, normalization, derived.ocean_mask)[:, 0]
         target_physical = engine_to_physical(truth, normalization, derived.ocean_mask)[:, 0]
         rollout_metrics = field_metrics(generated_physical, target_physical)
+        rollout_dates = [dataset.date_window(index)[-1] for index in range(length)]
         save_rollout_netcdf(generated_physical, target_physical,
-                            [item["date"] for item in items], derived.lat, derived.lon,
-                            output_dir / "test_rollout.nc", {"experiment": config["name"]},
+                            rollout_dates, derived.lat, derived.lon,
+                            output_dir / "test_rollout.nc",
+                            {"experiment": config["name"],
+                             "mode": "free_running",
+                             "initial_state_date": dataset.date_window(0)[0],
+                             "truth_resets": 0,
+                             "sampler": rollout_sampler,
+                             "sampler_steps": rollout_steps},
                             coarse=coarse_to_physical(conditions[0], normalization,
                                                       derived.ocean_mask_lr),
                             lat_lr=derived.lat_lr, lon_lr=derived.lon_lr)
@@ -189,7 +230,9 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--sampler-steps", type=int, nargs="+")
-    parser.add_argument("--sampler", choices=("euler", "heun", "ab2", "ab3_pc"))
+    parser.add_argument(
+        "--sampler", choices=("euler", "heun", "ab2", "ab2_pc", "ab3_pc")
+    )
     parser.add_argument("--rollout-days", type=int, default=10)
     arguments = parser.parse_args()
     samples = None if arguments.all_samples else arguments.samples

@@ -20,6 +20,7 @@ dask = ">=2024.1"
 matplotlib = ">=3.8,<4"
 tqdm = ">=4.66,<5"
 pytest = ">=8,<9"
+imageio-ffmpeg = ">=0.6,<1"
 
 [feature.cpu.dependencies]
 pytorch-cpu = ">=2.5,<3"
@@ -53,17 +54,25 @@ smoke-flow = { cmd = "python -u src/train_flow.py --config configs/flow_sr.json 
 smoke-flow-ar = { cmd = "python -u src/train_flow_ar.py --config configs/flow_ar.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 smoke-gan = { cmd = "python -u src/train_gan.py --config configs/gan_sr.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 smoke-gan-v2 = { cmd = "python -u src/train_gan.py --config configs/gan_sr_v2.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+smoke-gan-v2b = { cmd = "python -u src/train_gan.py --config configs/gan_sr_v2b_image_only_critic.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+smoke-gan-v3 = { cmd = "python -u src/train_gan.py --config configs/gan_sr_v3_hard_consistency.json --smoke-steps 3 --device cpu", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 
 # --- production training (submit through jobs/*.pbs) --------------------
 train-flow = { cmd = "python -u src/train_flow.py --config configs/flow_sr.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 train-flow-ar = { cmd = "python -u src/train_flow_ar.py --config configs/flow_ar.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 train-gan = { cmd = "python -u src/train_gan.py --config configs/gan_sr.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 train-gan-v2 = { cmd = "python -u src/train_gan.py --config configs/gan_sr_v2.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+train-gan-v2b = { cmd = "python -u src/train_gan.py --config configs/gan_sr_v2b_image_only_critic.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+train-gan-v3 = { cmd = "python -u src/train_gan.py --config configs/gan_sr_v3_hard_consistency.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+preprocess-combined = { cmd = "python -u src/preprocess_combined.py --config configs/flow_sr_combined_hist_rcp85_continue_320k.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+train-flow-combined = { cmd = "python -u src/train_flow.py --config configs/flow_sr_combined_hist_rcp85_continue_320k.json", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 
 # --- evaluation ---------------------------------------------------------
 evaluate-flow = { cmd = "python -u src/evaluate.py --run runs/flow_sr", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 evaluate-flow-ar = { cmd = "python -u src/evaluate.py --run runs/flow_ar", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 evaluate-gan = { cmd = "python -u src/evaluate.py --run runs/gan_sr", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 evaluate-gan-v2 = { cmd = "python -u src/evaluate.py --run runs/gan_sr_v2", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+evaluate-gan-v2b = { cmd = "python -u src/evaluate.py --run runs/gan_sr_v2b_image_only_critic", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
+evaluate-gan-v3 = { cmd = "python -u src/evaluate.py --run runs/gan_sr_v3_hard_consistency", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 infer-access-historical = { cmd = "python -u src/infer_access_cm2.py --config configs/access_cm2_inference.json --period-name historical", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }
 infer-access-future = { cmd = "python -u src/infer_access_cm2.py --config configs/access_cm2_inference.json --period-name future", env = { PYTHONPATH = "src", MPLBACKEND = "Agg" } }

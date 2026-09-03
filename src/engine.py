@@ -197,7 +197,10 @@ def build_scheduler(optimizer, config: dict):
     if config.get("scheduler_kind", "cosine") == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
     warmup = int(config.get("warmup_steps", 500))
-    total = int(config.get("max_steps", 100000))
+    # Continuation experiments may retain a global step counter while starting
+    # a fresh optimiser.  In that case schedule over the number of *new*
+    # updates, not over the inherited global step.
+    total = int(config.get("scheduler_total_steps", config.get("max_steps", 100000)))
     floor = float(config.get("min_learning_rate_factor", 0.05))
 
     def schedule(step: int) -> float:
@@ -274,6 +277,7 @@ def restore_training_state(
     device: torch.device,
     resume_from: str | Path | None = None,
     continuation_learning_rate: float | None = None,
+    reset_optimizers_on_external_fork: bool = False,
 ):
     """Resume locally, or fork a run from an external checkpoint.
 
@@ -291,7 +295,8 @@ def restore_training_state(
     for name, module in modules.items():
         module.load_state_dict(state[f"module_{name}"])
     for name, optimizer in optimizers.items():
-        optimizer.load_state_dict(state[f"optimizer_{name}"])
+        if not (external and reset_optimizers_on_external_fork):
+            optimizer.load_state_dict(state[f"optimizer_{name}"])
         if external and continuation_learning_rate is not None:
             for group in optimizer.param_groups:
                 group["lr"] = float(continuation_learning_rate)
@@ -302,7 +307,9 @@ def restore_training_state(
             scheduler.load_state_dict(state[key])
     restore_rng_state(state)
     step = int(state["step"])
-    mode = "fork" if external else "resume"
+    mode = "fork-fresh-optimizer" if (
+        external and reset_optimizers_on_external_fork
+    ) else ("fork" if external else "resume")
     print(f"[{mode}] step {step} from {path}", flush=True)
     return step, list(state.get("history", [])), dict(state.get("validation", {}))
 

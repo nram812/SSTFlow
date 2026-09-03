@@ -1,0 +1,9 @@
+#!/bin/bash
+#PBS -N sst-combined-prep
+#PBS -q shortq
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=08:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+pixi run preprocess-combined

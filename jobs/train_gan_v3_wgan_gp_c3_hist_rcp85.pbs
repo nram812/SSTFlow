@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -N sst-gan-v3-wgp
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+PYTHONPATH=src pixi run -e gpu python -u src/train_gan.py \
+  --config configs/gan_sr_v3_wgan_gp_c3_hist_rcp85_finetune_270k.json
+status=$(pixi run python -c 'import json; print(json.load(open("runs/gan_sr_v3_wgan_gp_c3_hist_rcp85_finetune_270k/status.json"))["status"])')
+if [[ "$status" == checkpointed ]]; then qsub jobs/train_gan_v3_wgan_gp_c3_hist_rcp85.pbs; fi

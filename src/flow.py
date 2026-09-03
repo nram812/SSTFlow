@@ -22,7 +22,7 @@ from consistency import project_to_coarse
 from losses import apply_mask, masked_mse
 
 #: Samplers exposed to configs and the command line.
-SAMPLERS = ("euler", "heun", "ab2", "ab3_pc")
+SAMPLERS = ("euler", "heun", "ab2", "ab2_pc", "ab3_pc")
 
 
 def masked_noise(
@@ -176,6 +176,67 @@ def ab2_sample(
     return state
 
 
+def ab2_pc_sample(
+    model,
+    initial_noise: torch.Tensor,
+    condition: torch.Tensor,
+    mask: torch.Tensor,
+    steps: int,
+    previous_state: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """AB2 predictor with a second-order Adams-Moulton corrector.
+
+    The first interval is Heun (Euler predictor plus trapezoidal corrector),
+    which supplies the velocity history needed by Adams-Bashforth 2.  Later
+    intervals predict with ``3/2 f_n - 1/2 f_{n-1}`` and correct with the
+    trapezoidal Adams-Moulton rule using the velocity at the predicted
+    endpoint.  Velocity history is local to one flow ODE solve and is reset for
+    every physical day in an autoregressive rollout.
+
+    This is intentionally distinct from :func:`ab2_sample`, which has no
+    corrector, and :func:`ab3_pc_sample`, whose predictor/corrector formulas are
+    third order.
+    """
+    if steps < 1:
+        raise ValueError("The sampler needs at least one step")
+    state = apply_mask(initial_noise, mask)
+    dt = 1.0 / steps
+    previous_velocity = None
+    for index in range(steps):
+        now = index * dt
+        following = min((index + 1) * dt, 1.0)
+        velocity = _call(
+            model,
+            state,
+            condition,
+            mask,
+            _time_tensor(now, state),
+            previous_state,
+        )
+        if previous_velocity is None:
+            predicted = state + dt * velocity
+        else:
+            predicted = state + dt * (
+                1.5 * velocity - 0.5 * previous_velocity
+            )
+        predicted = apply_mask(predicted, mask)
+        endpoint_velocity = _call(
+            model,
+            predicted,
+            condition,
+            mask,
+            _time_tensor(following, state),
+            previous_state,
+        )
+        state = apply_mask(
+            state + 0.5 * dt * (velocity + endpoint_velocity), mask
+        )
+        # ``velocity`` was evaluated at the corrected state at t_n, so it is
+        # the correct f_n history entry for the following AB2 prediction.
+        previous_velocity = velocity
+    return state
+
+
 def ab3_pc_sample(
     model,
     initial_noise: torch.Tensor,
@@ -261,6 +322,7 @@ def get_sampler(name: str):
         "euler": euler_sample,
         "heun": heun_sample,
         "ab2": ab2_sample,
+        "ab2_pc": ab2_pc_sample,
         "ab3_pc": ab3_pc_sample,
     }
     if name not in samplers:
@@ -303,6 +365,7 @@ def rollout(
     sampler: str = "heun",
     generator=None,
     enforce_coarse_consistency: bool = False,
+    noise_correlation: float = 0.0,
 ) -> torch.Tensor:
     """Free-running autoregressive rollout.
 
@@ -315,12 +378,23 @@ def rollout(
             f"Expected (batch, lead, channel, lat, lon) conditions, got "
             f"{tuple(conditions.shape)}"
         )
+    if not 0.0 <= noise_correlation <= 1.0:
+        raise ValueError("noise_correlation must lie in [0, 1]")
     predictions = []
     state = apply_mask(initial_state, mask)
+    latent_noise = None
     for lead in range(conditions.shape[1]):
-        noise = masked_noise(state, mask, generator)
+        innovation = masked_noise(state, mask, generator)
+        if latent_noise is None:
+            latent_noise = innovation
+        else:
+            latent_noise = (
+                noise_correlation * latent_noise
+                + (1.0 - noise_correlation**2) ** 0.5 * innovation
+            )
+            latent_noise = apply_mask(latent_noise, mask)
         state = get_sampler(sampler)(
-            model, noise, conditions[:, lead], mask, steps, state
+            model, latent_noise, conditions[:, lead], mask, steps, state
         )
         if enforce_coarse_consistency:
             state = project_to_coarse(state, conditions[:, lead], mask)

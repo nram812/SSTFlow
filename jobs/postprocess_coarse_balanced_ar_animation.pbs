@@ -1,0 +1,18 @@
+#!/bin/bash
+#PBS -N sst-ar-anim-docs
+#PBS -q shortq
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+export PYTHONPATH="$PWD/src"
+export MPLBACKEND=Agg
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib-ar-animation-docs"
+mkdir -p "$MPLCONFIGDIR"
+
+test -s figures/flow_ar_legacy_coarse_balanced_sst_preview.gif
+test -s figures/flow_ar_legacy_coarse_balanced_sst_comparison_300frames.mp4
+pixi run python analysis/update_comparison_notebooks.py
+pixi run python presentation/build_editable_sst_downscaling_deck.py
+pixi run python -m pytest tests/test_editable_presentation.py -q

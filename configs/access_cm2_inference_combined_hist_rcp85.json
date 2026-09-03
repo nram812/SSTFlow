@@ -1,0 +1,25 @@
+{
+  "name": "access_cm2_combined_hist_rcp85_ab3pc75",
+  "description": "Downscale converted ACCESS-CM2 SST with the completed historical-plus-RCP8.5 flow EMA",
+  "input_path": "derived/sst_downscaling_access_converted.nc",
+  "variable": "sst_lr",
+  "run_dir": "runs/flow_sr_combined_hist_rcp85_continue_320k",
+  "sampler": "ab3_pc",
+  "sampler_steps": 75,
+  "batch_size": 4,
+  "seed": 42,
+  "periods": {
+    "historical": {
+      "start": "1980-01-01",
+      "end": "1989-12-31",
+      "expected_days": 3653,
+      "output": "runs/flow_sr_combined_hist_rcp85_continue_320k/access_cm2_converted/historical_1980-01-01_1989-12-31_ab3pc_75step.nc"
+    },
+    "future": {
+      "start": "2080-01-01",
+      "end": "2089-12-31",
+      "expected_days": 3653,
+      "output": "runs/flow_sr_combined_hist_rcp85_continue_320k/access_cm2_converted/future_2080-01-01_2089-12-31_ab3pc_75step.nc"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N sst-noaa-access-150
+#PBS -q h200q
+#PBS -l select=1:ncpus=12:mem=128GB:ngpus=1
+#PBS -l walltime=16:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?submit this script from the project root}"
+pixi run python -c 'import json; s=json.load(open("runs/flow_sr_noaa_5km_decoder_continue_150k/status.json")); assert s["status"] == "passed" and s["step"] == 150000, s'
+for period in historical future; do
+  PYTHONPATH=src pixi run -e gpu python -u src/infer_noaa_5km.py access \
+    --config configs/noaa_5km_inference_150k.json --period-name "$period" --device cuda
+  PYTHONPATH=src pixi run python -u src/validate_noaa_inference.py access \
+    --config configs/noaa_5km_inference_150k.json --period-name "$period"
+done

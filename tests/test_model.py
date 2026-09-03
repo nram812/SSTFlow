@@ -41,6 +41,8 @@ def make_ar(levels=3, base=8, path_dropout=0.5):
         attention_heads=2,
         lag_base_channels=4,
         lag_path_dropout=path_dropout,
+        lag_guidance_scale=0.25,
+        lag_conditioning="within_block_anomaly",
     )
 
 
@@ -186,6 +188,47 @@ def test_build_model_factory():
     )
     with pytest.raises(ValueError, match="Unknown model_kind"):
         build_model({"model_kind": "nope"})
+
+
+def test_missing_lag_controls_restore_legacy_checkpoint_semantics():
+    model = build_model(
+        {
+            "model_kind": "autoregressive",
+            "base_channels": 8,
+            "levels": 3,
+            "attention": False,
+            "lag_base_channels": 4,
+        }
+    )
+    assert model.lag_conditioning == "full_state"
+    assert all(fusion.guidance_scale == 1.0 for fusion in model.fusion)
+
+
+def test_new_lag_controls_are_explicit_and_validated():
+    model = build_model(
+        {
+            "model_kind": "autoregressive",
+            "base_channels": 8,
+            "levels": 3,
+            "attention": False,
+            "lag_base_channels": 4,
+            "lag_conditioning": "within_block_anomaly",
+            "lag_guidance_scale": 0.25,
+        }
+    )
+    assert model.lag_conditioning == "within_block_anomaly"
+    assert all(fusion.guidance_scale == 0.25 for fusion in model.fusion)
+    with pytest.raises(ValueError, match="lag_conditioning"):
+        build_model(
+            {
+                "model_kind": "autoregressive",
+                "base_channels": 8,
+                "levels": 3,
+                "attention": False,
+                "lag_base_channels": 4,
+                "lag_conditioning": "changed_after_training",
+            }
+        )
 
 
 def test_parameter_count_reasonable():
