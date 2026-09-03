@@ -11,9 +11,14 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
-from model_srdn_advanced import SRDCNN_SST_v3, SRDN_ResAFNO_v4
+from model_srdn_advanced import (
+    CoarseConsistencyProjection,
+    SRDCNN_SST_v3,
+    SRDN_ResAFNO_v4,
+)
 from srdn_data import DerivedProduct, SRDNData
 from srdn_metrics import denormalize, masked_field_metrics, write_json
+from srdn_previews import save_prediction_preview
 
 
 def load_config(path: str | Path) -> dict:
@@ -117,6 +122,54 @@ def validation_metrics(model, dataset: SRDNData, positions: np.ndarray):
     return masked_field_metrics(prediction, target, mask)
 
 
+def save_validation_preview(
+    model,
+    model_label: str,
+    dataset: SRDNData,
+    derived: DerivedProduct,
+    positions: np.ndarray,
+    run_dir: Path,
+    step: int,
+    device: str,
+    enforce_coarse_consistency: bool,
+) -> None:
+    """Write a fixed validation example so checkpoint images are comparable."""
+    position = int(positions[0])
+    inputs, target_normalized = dataset.batch([position])
+    tensor_inputs = {
+        key: tf.convert_to_tensor(value) for key, value in inputs.items()
+    }
+    with tf.device(device):
+        prediction_normalized = model(tensor_inputs, training=False).numpy()
+        bilinear_normalized = tf.image.resize(
+            tensor_inputs["coarse_sst"], derived.fine_shape, method="bilinear"
+        ) * tensor_inputs["fine_mask"]
+        if enforce_coarse_consistency:
+            bilinear_normalized = CoarseConsistencyProjection(derived.coarsen_factor)(
+                [
+                    bilinear_normalized,
+                    tensor_inputs["coarse_sst"],
+                    tensor_inputs["coarse_mask"],
+                    tensor_inputs["fine_mask"],
+                ]
+            )
+    mask = inputs["fine_mask"][0, ..., 0].astype(bool)
+    target = denormalize(target_normalized[0, ..., 0], dataset.mean, dataset.std)
+    bilinear = denormalize(bilinear_normalized.numpy()[0, ..., 0], dataset.mean, dataset.std)
+    prediction = denormalize(prediction_normalized[0, ..., 0], dataset.mean, dataset.std)
+    save_prediction_preview(
+        run_dir / "predictions" / f"prediction_step_{step:06d}.png",
+        target,
+        bilinear,
+        prediction,
+        mask,
+        derived.lat,
+        derived.lon,
+        f"{model_label} validation example — step {step:,} — "
+        f"{dataset.dates[position]}",
+    )
+
+
 def save_checkpoint(manager, run_dir: Path, model, optimizer, step):
     checkpoint_path = manager.save(checkpoint_number=int(step))
     model_path = run_dir / "model.weights.h5"
@@ -197,6 +250,7 @@ def train(
     batch_size = int(config.get("batch_size", 2))
     batches_per_epoch = max(1, (len(train_data) + batch_size - 1) // batch_size)
     epoch, batch_offset = divmod(step, batches_per_epoch)
+    preview_every = int(config.get("preview_every", 0))
 
     try:
         while step < max_steps:
@@ -236,6 +290,22 @@ def train(
                     metrics = validation_metrics(model, validation_data, validation_positions)
                     print(f"[validation] {json.dumps(metrics, sort_keys=True)}", flush=True)
                     write_json(run_dir / f"validation_step_{step:06d}.json", metrics)
+                if preview_every > 0 and step % preview_every == 0:
+                    save_validation_preview(
+                        model,
+                        config["model_variant"].upper(),
+                        validation_data,
+                        derived,
+                        validation_positions,
+                        run_dir,
+                        step,
+                        device,
+                        bool(config.get("enforce_coarse_consistency", True)),
+                    )
+                    print(
+                        f"[preview] wrote {run_dir / 'predictions' / f'prediction_step_{step:06d}.png'}",
+                        flush=True,
+                    )
                 if step % int(config.get("checkpoint_every", 1000)) == 0:
                     save_checkpoint(manager, run_dir, model, optimizer, step)
                     write_json(run_dir / "training_history.json", {"history": history})

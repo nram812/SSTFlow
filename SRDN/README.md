@@ -19,8 +19,9 @@ when enabled, the valid fine-grid mean in each valid 16x16 block is projected
 to the corresponding normalized coarse SST.  Training uses masked MSE and the
 normalization in `../reports/normalization_f16.json`, fitted only on 1979-2008.
 
-The conventional baseline preserves the original three 7x7 stride-2
-transpose convolutions.  ResAFNO adds the canonical shared channel-block AFNO
+The conventional baseline preserves the original 7x7 stride-2
+transpose-convolution topology, extended to four 2x blocks because this
+dataset is 16x.  ResAFNO adds the canonical shared channel-block AFNO
 trunk, FiLM conditioning, and progressive bilinear/refinement upsampling.  The
 AFNO layer is not claimed to make every pixel nonzero for an impulse; its
 diagnostics test controlled nonlocal response, translation equivariance,
@@ -81,8 +82,10 @@ qsub -v MODEL=srdcnn jobs/srdn_train_pilot.pbs
 qsub -v MODEL=resafno jobs/srdn_train_pilot.pbs
 ```
 
-4. Only if both 10,000-step pilots are stable should the 120,000-step jobs and
-`jobs/srdn_evaluate.pbs` be submitted.
+4. Only if both 10,000-step pilots are stable should the 150,000-step jobs and
+`jobs/srdn_evaluate.pbs` be submitted.  The configurations write a fixed
+validation prediction image every 15,000 steps to
+`runs/<model>_mask_aware_f16/predictions/`.
 
 The GPU smoke job hard-fails if TensorFlow exposes no GPU and checks forward,
 backward, exact masking, coarse consistency, and checkpoint reload for both
