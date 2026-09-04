@@ -185,6 +185,7 @@ def train(
     device_name: str | None = None,
     max_steps_override: int | None = None,
     output_dir_override: str | Path | None = None,
+    resume_from_override: str | Path | None = None,
 ):
     device = configure_device(device_name or config.get("device", "cpu"))
     seed = int(config.get("seed", 42))
@@ -199,6 +200,10 @@ def train(
             config["smoke_output_dir"] if smoke_steps is not None else config["output_dir"]
         )
     run_dir.mkdir(parents=True, exist_ok=True)
+    config = dict(config)
+    config["effective_output_dir"] = str(run_dir.resolve())
+    if resume_from_override is not None:
+        config["resume_from"] = str(Path(resume_from_override).resolve())
     write_json(run_dir / "config_used.json", config)
     write_json(run_dir / "status.json", {"status": "running", "step": 0})
 
@@ -229,11 +234,29 @@ def train(
         manager = tf.train.CheckpointManager(
             checkpoint, str(run_dir / "checkpoints"), max_to_keep=3
         )
-        if manager.latest_checkpoint:
-            checkpoint.restore(manager.latest_checkpoint).expect_partial()
-            print(f"[resume] {manager.latest_checkpoint}", flush=True)
+        # A continuation can write to a new run directory while restoring from
+        # an earlier run.  Once that continuation has checkpointed, prefer its
+        # own latest checkpoint so PBS resubmissions do not restart from the
+        # original source checkpoint.
+        restore_path = manager.latest_checkpoint
+        if restore_path is None and resume_from_override is not None:
+            resume_path = Path(resume_from_override)
+            if resume_path.is_dir():
+                restore_path = tf.train.latest_checkpoint(str(resume_path))
+            else:
+                restore_path = str(resume_path)
+                if restore_path.endswith(".index"):
+                    restore_path = restore_path[:-len(".index")]
+            if not restore_path or not Path(restore_path + ".index").exists():
+                raise FileNotFoundError(
+                    f"no resume checkpoint found at {resume_path}"
+                )
+        if restore_path:
+            checkpoint.restore(restore_path).expect_partial()
+            print(f"[resume] {restore_path}", flush=True)
 
     step = int(step_variable.numpy())
+    start_step = step
     max_steps = int(
         smoke_steps
         if smoke_steps is not None
@@ -329,8 +352,12 @@ def train(
     status = "passed" if step >= max_steps else "checkpointed"
     write_json(run_dir / "status.json", {
         "status": status,
+        "start_step": int(start_step),
         "step": int(step),
         "max_steps": int(max_steps),
+        "batch_size": int(batch_size),
+        "batches_per_epoch": int(batches_per_epoch),
+        "effective_epochs": float(step / batches_per_epoch),
         "model_variant": config["model_variant"],
         "parameters": int(model.count_params()),
         "elapsed_seconds": time.monotonic() - started,
@@ -346,13 +373,31 @@ def main():
     parser.add_argument("--smoke-steps", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override config batch_size; useful for matched continuation runs.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Checkpoint prefix or checkpoint directory to restore when the output directory is new.",
+    )
     args = parser.parse_args()
+    config = load_config(args.config)
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            parser.error("--batch-size must be positive")
+        config["batch_size"] = args.batch_size
     train(
-        load_config(args.config),
+        config,
         args.smoke_steps,
         args.device,
         args.max_steps,
         args.output_dir,
+        args.resume_from,
     )
 
 

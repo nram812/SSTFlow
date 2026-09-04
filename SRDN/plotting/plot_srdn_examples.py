@@ -29,14 +29,26 @@ def read_sample(path: Path, index: int):
         }
 
 
-def plot(srdcnn_path: Path, resafno_path: Path, output: Path, index: int = 0):
+def plot(
+    srdcnn_path: Path,
+    resafno_path: Path,
+    output: Path,
+    index: int = 0,
+    srdcnn_step: str = "unknown",
+    resafno_step: str = "unknown",
+):
     cnn = read_sample(srdcnn_path, index)
     afno = read_sample(resafno_path, index)
     if cnn["date"] != afno["date"]:
         raise ValueError("sample NetCDF files do not contain matched dates")
     target = cnn["target"]
     fields = [target, cnn["bilinear"], cnn["prediction"], afno["prediction"]]
-    names = ["Target", "Bilinear", "SRDCNN", "ResAFNO"]
+    names = [
+        "Target",
+        "Bilinear",
+        f"SRDCNN (step {srdcnn_step})",
+        f"ResAFNO (step {resafno_step})",
+    ]
     ocean = np.isfinite(target)
     values = np.concatenate([field[ocean] for field in fields])
     vmin, vmax = np.quantile(values, [0.01, 0.99])
@@ -67,7 +79,10 @@ def plot(srdcnn_path: Path, resafno_path: Path, output: Path, index: int = 0):
         axis.set_xlabel("longitude")
         axis.set_ylabel("latitude")
     figure.colorbar(image, ax=axes[1].tolist(), label="difference (°C)", shrink=0.8)
-    figure.suptitle(f"SRDN 10k pilot example: {cnn['date']} (held-out test period)")
+    figure.suptitle(
+        f"SRDN current-checkpoint example: {cnn['date']} (held-out test period)\n"
+        f"SRDCNN step {srdcnn_step} vs ResAFNO step {resafno_step}"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=180)
     plt.close(figure)
@@ -80,8 +95,17 @@ def main():
     parser.add_argument("--resafno", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--srdcnn-step", default="unknown")
+    parser.add_argument("--resafno-step", default="unknown")
     args = parser.parse_args()
-    plot(args.srdcnn, args.resafno, args.output, args.index)
+    plot(
+        args.srdcnn,
+        args.resafno,
+        args.output,
+        args.index,
+        args.srdcnn_step,
+        args.resafno_step,
+    )
 
 
 if __name__ == "__main__":

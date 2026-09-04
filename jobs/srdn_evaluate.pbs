@@ -11,11 +11,12 @@ RUN_TAG="${RUN_TAG:-mask_aware_f16}"
 if [[ ! -x "$PYBIN" ]]; then echo "Missing GPU Python: $PYBIN" >&2; exit 2; fi
 export PYTHONPATH="$PWD/SRDN"
 for MODEL in srdcnn resafno; do
-  "$PYBIN" -u SRDN/evaluate_srdn.py \
+  "$PYBIN" -u SRDN/evaluation/evaluate_srdn.py \
     --run "runs/srdn_${MODEL}_${RUN_TAG}" \
     --config "configs/srdn_${MODEL}.json" --batch-size 2
 done
-"$PYBIN" -u SRDN/compare_srdn.py \
+"$PYBIN" -u SRDN/evaluation/compare_srdn.py \
   --resafno-run "runs/srdn_resafno_${RUN_TAG}" \
   --srdcnn-run "runs/srdn_srdcnn_${RUN_TAG}" \
   --output "runs/srdn_comparison_${RUN_TAG}.json"
+

@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime
+import sys
 from pathlib import Path
+
+# Ensure SRDN parent directory is on sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import netCDF4
 import numpy as np

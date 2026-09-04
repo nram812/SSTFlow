@@ -670,3 +670,41 @@ Each training job inspects `runs/<name>/status.json` on exit and re-submits itse
 | AR degenerates to persistence | Remove lag block means, cap lag FiLM at 0.25, use 50% path dropout, enforce current coarse means, and report an evolution ratio in diagnostic sequences |
 | GAN divergence | Spectral norm, hinge loss, delayed adversarial start, `λ_content = 10` dominating early training |
 | NETCDF3 handles in DataLoader workers | Handles are opened lazily per process and excluded from pickling (`_SourceReader.__getstate__`) |
+
+## 9. SRDN ResAFNO validation addendum
+
+This TensorFlow experiment is separate from the PyTorch flow/GAN production
+models above.  Its implementation and current evidence are:
+
+| Component | Status on 2026-09-03 | Evidence |
+|---|---|---|
+| 16x mask-aware model contract | **PASS** | `SRDN/model_srdn_advanced.py`; both models accept three named inputs and return `(B,512,512,1)` |
+| AFNO mathematical diagnostics | **PASS** | `SRDN/test_diagnostics.py`; FFT/Parseval, controlled nonlocal response, phase-equivariant shifts, single-mode spectral response, finite gradients |
+| Exact land masking/coarse projection | **PASS** | diagnostics and `SRDN/test_real_data.py`; real-data land leakage zero and block error ~5e-7 °C |
+| Real OFAM loader/date/normalization contract | **PASS** | two 2011 days decoded from immutable raw NetCDF; derived mask fingerprint and dates verified |
+| CPU TensorFlow 2.6 legacy environment | **PASS** | 8 diagnostics, real-data contract, dummy forward/backward, two-step trainer/evaluator smokes |
+| Pinned TensorFlow 2.15.1 CPU/GPU environments | **PASS** | `SRDN/requirements-{cpu,gpu}.txt`, `SRDN/environment.md`; CPU and GPU venvs installed and GPU fallback is rejected |
+| H200 forward/backward/checkpoint gate | **PASS** | PBS job `6409858`; both variants used NVIDIA H200, finite gradients, zero land leakage, and reload error 0 |
+| Matched 10k pilots | **PASS; ResAFNO not better at pilot** | PBS jobs `6409860`, `6409861`; both passed; full test comparison is `runs/srdn_comparison_pilot_10k.json` |
+| Full 120k training and 2011-2014 streaming comparison | **SUPERSEDED** | Original PBS jobs `6409865`, `6409866`; continuation now targets 150,000 steps |
+
+The SRDN continuation was extended to 150,000 optimization steps after the
+initial full jobs.  Dependent PBS jobs `6409868.pbsserver03` (SRDCNN) and
+`6409869.pbsserver03` (ResAFNO) resume the existing checkpoints without
+concurrent writes.  Both configurations write a fixed validation prediction
+figure at steps 15,000, 30,000, ..., 150,000 under each run's `predictions/`
+directory; because the initial 120,000-step jobs predated this callback, the
+continuation will newly produce the 135,000 and 150,000 figures.
+
+`SRDN/Jupyter_SRDCNN_ResAFNO.20260903.ipynb` was regenerated to follow the
+standard `Jupyter_SRDCNN_stand.20260901.ipynb` layout: environment checks,
+configuration/imports, a `dummy()` model/data execution function, an explicit
+run cell, visual prediction comparison, NetCDF inspection, and run commands.
+The notebook was executed successfully in the pinned TensorFlow 2.15.1
+environment on the real OFAM data.
+
+The corrected notebook `SRDN/Jupyter_SRDCNN_ResAFNO.20260903.ipynb` imports the
+canonical implementation rather than duplicating it.  It was regenerated and
+executed successfully on CPU, with real-data outputs and diagnostics stored in
+the notebook.  The former notebook code should not be used as a standalone
+model implementation.

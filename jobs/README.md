@@ -1,69 +1,137 @@
-# PBS job catalogue
+# PBS Job Catalogue & Training Guide
 
-The job directory preserves production provenance, so it contains more files
-than a new user normally needs.  The tables below identify the supported entry
-points.  Run CPU tests and the matching H200 smoke job before any production
-submission.  All commands assume the repository root as the working directory.
+This directory contains PBS job submission scripts for the SST downscaling models (16x super-resolution from 32x32 to 512x512 over the Australia OFAM domain).
 
-## Core 0.1° models
+All commands assume the repository root (`/esi/project/niwa03712/rampaln/PUBLICATIONS/2026/SSTDownscaling`) as the working directory.
 
-| Purpose | Smoke / gate | Production or inference |
-|---|---|---|
-| Historical Flow-SR | `gpu_smoke.pbs` | `train_flow.pbs`, `infer_flow_full_test_ab3pc75.pbs`, `infer_access_cm2_periods.pbs` |
-| Historical autoregressive flow | `gpu_smoke_flow_ar_rollout.pbs` | `train_flow_ar.pbs`, `infer_flow_ar_test_year_ab2pc75.pbs` |
-| Residual-memory Flow-AR | `gpu_smoke_flow_ar_residual_memory.pbs` | `train_flow_ar_residual_memory.pbs`, `infer_flow_ar_residual_memory_year_ab2pc75.pbs` |
-| Coarse-balanced legacy AR ablation | `gpu_smoke_flow_ar_legacy_coarse_balanced.pbs` | `train_flow_ar_legacy_coarse_balanced.pbs`, `infer_flow_ar_legacy_coarse_balanced_year_ab2pc75.pbs` |
-| Historical GAN-v2 | `gpu_smoke.pbs` | `train_gan_v2.pbs`, `infer_gan_historical_models.pbs` |
-| Image-only-critic GAN-v2b | `gpu_smoke_gan_v2b.pbs` | `train_gan_v2b.pbs`, `infer_gan_historical_models.pbs` |
-| Hard-consistent GAN-v3 | `gpu_smoke.pbs` | `train_gan_v3.pbs`, `infer_gan_historical_models.pbs` |
+---
 
-## Historical + future continuations
+## 1. Master Training Job Catalogue
 
-| Purpose | Smoke / gate | Production or inference |
-|---|---|---|
-| Prepare combined OFAM mapping | — | `preprocess_combined_hist_rcp85.pbs` |
-| Combined Flow-SR | `gpu_smoke_combined.pbs` | `train_flow_combined_hist_rcp85.pbs`, `infer_combined_flow_test_access.pbs` |
-| Combined GAN-v2/v2b/v3 | `gpu_smoke_gan_hist_rcp85.pbs` | `train_gan_v2_hist_rcp85.pbs`, `train_gan_v2b_hist_rcp85.pbs`, `train_gan_v3_hist_rcp85.pbs`, then `infer_gan_hist_rcp85_models.pbs` |
+| Model Family | Variant | Smoke Job | Production Training Job | Evaluation Job | Environment | Output Directory |
+|---|---|---|---|---|---|---|
+| **SRDN** | **SRDCNN** (Baseline, 0.61M) | `srdn_gpu_smoke.pbs` | `srdn_train_full.pbs` (`MODEL=srdcnn`) | `srdn_evaluate.pbs` | `SRDN/venv_srdn_gpu` | `runs/srdn_srdcnn_mask_aware_f16` |
+| **SRDN** | **ResAFNO** (Canonical, ~5M) | `srdn_gpu_smoke.pbs` | `srdn_train_full.pbs` (`MODEL=resafno`) | `srdn_evaluate.pbs` | `SRDN/venv_srdn_gpu` | `runs/srdn_resafno_mask_aware_f16` |
+| **SRDN** | **Batch-8 Continuation** | — | `srdn_train_batch8.pbs` | `srdn_evaluate.pbs` | `SRDN/venv_srdn_gpu` | `runs/srdn_*_batch8_continue` |
+| **GAN** | **GAN-v3** (Hard Consistency) | `gpu_smoke.pbs` | `train_gan_v3.pbs` | `infer_gan_historical_models.pbs` | `.pixi/envs/gpu` | `runs/gan_sr_v3_hard_consistency` |
+| **GAN** | **GAN-v2b** (Image-Only Critic) | `gpu_smoke_gan_v2b.pbs` | `train_gan_v2b.pbs` | `infer_gan_historical_models.pbs` | `.pixi/envs/gpu` | `runs/gan_sr_v2b_image_only_critic` |
+| **Flow** | **Flow-SR** (Continuous-Time OT-CFM) | `gpu_smoke.pbs` | `train_flow.pbs` / `train_flow_continue.pbs` | `infer_flow_full_test_ab3pc75.pbs` | `.pixi/envs/gpu` | `runs/flow_sr_continue_220k` |
+| **Flow** | **Flow-AR** (Autoregressive) | `gpu_smoke_flow_ar_rollout.pbs` | `train_flow_ar.pbs` | `infer_flow_ar_test_year_ab2pc75.pbs` | `.pixi/envs/gpu` | `runs/flow_ar` |
+| **Flow** | **Residual-Memory Flow-AR** | `gpu_smoke_flow_ar_residual_memory.pbs` | `train_flow_ar_residual_memory.pbs` | `infer_flow_ar_residual_memory_year_ab2pc75.pbs` | `.pixi/envs/gpu` | `runs/flow_ar_residual_memory` |
 
-## NOAA 0.05° transfer
+---
 
-| Stage | Smoke / gate | Production or inference |
-|---|---|---|
-| Prepare NOAA predictor/target mapping | — | `preprocess_noaa_5km.pbs` |
-| Frozen-trunk head stage | `gpu_smoke_noaa_5km_v2.pbs` | `train_flow_noaa_5km_v2.pbs` |
-| Decoder-unfrozen stage | `gpu_smoke_noaa_5km_decoder.pbs` | `train_flow_noaa_5km_decoder_38k.pbs` |
-| Low-rate continuation to 150k | `gpu_smoke_noaa_5km_decoder_150k.pbs` | `train_flow_noaa_5km_decoder_150k.pbs` |
-| Final inference | `profile_noaa_5km_inference.pbs` | `infer_noaa_5km_test_150k.pbs`, `infer_noaa_5km_access_150k.pbs` |
+## 2. Environment Specifications
 
-## Evaluation and rendering
+> [!IMPORTANT]
+> The repository uses two distinct Python environments depending on the framework:
+> - **TensorFlow SRDN Suite**: Uses `SRDN/venv_srdn_gpu` (Python 3.9 + TensorFlow 2.15.1 + CUDA 12).
+> - **PyTorch Production Suite**: Uses Pixi (`.pixi/envs/gpu` or `.pixi/envs/default`, Python 3.12 + PyTorch 2.5).
+> 
+> Never attempt to run the SRDN jobs with Pixi or PyTorch jobs with `venv_srdn_gpu`.
 
-- `generate_all_figures_and_animations.pbs`: full figure/animation pipeline.
-- `render_all_deliverables.pbs`: rebuild static deliverables.
-- `render_all_animations_shortq.pbs`: render animations on the short queue.
-- `render_flow_ar_legacy_coarse_balanced_animation.pbs`: one specific AR animation.
-- `postprocess_coarse_balanced_ar_comparison.pbs`: refresh AR comparison metrics.
+### A. TensorFlow Environment (`SRDN/venv_srdn_gpu`)
+- **Python**: `/esi/project/niwa03712/rampaln/PUBLICATIONS/2026/SSTDownscaling/SRDN/venv_srdn_gpu/bin/python`
+- **Packages**: TensorFlow 2.15.1, CUDA 12 support, xarray, netCDF4, matplotlib
+- **Used by**: `srdn_gpu_smoke.pbs`, `srdn_train_pilot.pbs`, `srdn_train_full.pbs`, `srdn_train_batch8.pbs`, `srdn_evaluate.pbs`, and all notebooks in `SRDN/notebooks/`.
 
-## SRDN 16x ResAFNO validation
+### B. PyTorch Environment (Pixi)
+- **Python**: Managed via Pixi (`pixi run -e gpu ...` or `.pixi/envs/gpu/bin/python`)
+- **Packages**: PyTorch 2.5+, CUDA 12, xarray, netCDF4, dask, matplotlib
+- **Used by**: `train_flow*.pbs`, `train_gan*.pbs`, `gpu_smoke*.pbs`, `infer_*.pbs`.
 
-| Stage | Launcher | Output / gate |
-|---|---|---|
-| CPU diagnostics | `SRDN/test_diagnostics.py`, `SRDN/test_real_data.py` | mask, AFNO, projection, and real-data contract |
-| H200 gate | `srdn_gpu_smoke.pbs` | `runs/smoke/srdn_gpu/report.json` |
-| 10k matched pilots | `srdn_train_pilot.pbs` with `MODEL=srdcnn` and `MODEL=resafno` | `runs/srdn_*_pilot_10k` |
-| Full training | `srdn_train_full.pbs` with `MODEL=srdcnn` and `MODEL=resafno` | `runs/srdn_*_mask_aware_f16` |
-| Held-out evaluation | `srdn_evaluate.pbs` | `runs/srdn_comparison.json` |
+---
 
-These jobs use `SRDN/environment.md` and deliberately require the separate
-`venv_srdn_gpu`; the old notebook `venv_srdn` is CPU-only and incomplete.
+## 3. How to Submit Correct Training Jobs
 
-## Diagnostic or superseded launchers
+### A. SRDN Models (SRDCNN and ResAFNO)
 
-Files named `check_*`, `profile_*`, `preflight_*`, `bridge_*`, or
-`smoke_then_*` are reproducibility and debugging tools rather than the normal
-starting point. `train_gan.pbs` targets the retired first GAN and should not be
-used for new science. Prefer GAN-v2 or v3 and read
-[the GAN experiment guide](../docs/gan_experiment_guide.md).
+1. **Pre-flight Gate (Smoke Test)**:
+   ```bash
+   qsub jobs/srdn_gpu_smoke.pbs
+   ```
+   Checks forward pass, backward pass, land masking, and checkpoint loading. Output: `runs/smoke/srdn_gpu/report.json`.
 
-Check job state with `qstat`; inspect `logs/<job-name>.o<job-id>`; and confirm
-`runs/<experiment>/status.json` plus the independent validation JSON before
-using a product in analysis.
+2. **10,000-Step Matched Pilot Training**:
+   ```bash
+   qsub -v MODEL=srdcnn jobs/srdn_train_pilot.pbs
+   qsub -v MODEL=resafno jobs/srdn_train_pilot.pbs
+   ```
+
+3. **Full Production Training (150,000 steps with auto-resubmit)**:
+   ```bash
+   qsub -v MODEL=srdcnn jobs/srdn_train_full.pbs
+   qsub -v MODEL=resafno jobs/srdn_train_full.pbs
+   ```
+   The job automatically checkpoints and resubmits itself if the 24-hour walltime expires before reaching `MAX_STEPS`.
+
+4. **Production Batch-8 Continuation (300,000 steps)**:
+   ```bash
+   qsub -v MODEL=srdcnn,OUTPUT_DIR=runs/srdn_srdcnn_mask_aware_f16_batch8_continue,RESUME_FROM=runs/srdn_srdcnn_mask_aware_f16/model.weights.h5 jobs/srdn_train_batch8.pbs
+   qsub -v MODEL=resafno,OUTPUT_DIR=runs/srdn_resafno_mask_aware_f16_batch8_continue,RESUME_FROM=runs/srdn_resafno_mask_aware_f16/model.weights.h5 jobs/srdn_train_batch8.pbs
+   ```
+
+5. **Independent Held-Out Evaluation**:
+   ```bash
+   qsub jobs/srdn_evaluate.pbs
+   ```
+   Evaluates both models on test set, computing paired MSE bootstrap confidence intervals in `runs/srdn_comparison.json`.
+
+---
+
+### B. GAN Models
+
+1. **Smoke Test**:
+   ```bash
+   qsub jobs/gpu_smoke.pbs
+   ```
+
+2. **Production Training**:
+   ```bash
+   # Primary hard-consistent GAN-v3:
+   qsub jobs/train_gan_v3.pbs
+   
+   # Image-only critic ablation GAN-v2b:
+   qsub jobs/train_gan_v2b.pbs
+   ```
+
+3. **Inference & Metrics**:
+   ```bash
+   qsub jobs/infer_gan_historical_models.pbs
+   ```
+
+---
+
+### C. Flow Matching Models
+
+1. **Smoke Test**:
+   ```bash
+   qsub jobs/gpu_smoke.pbs
+   ```
+
+2. **Production Training**:
+   ```bash
+   # Flow-SR (from scratch):
+   qsub jobs/train_flow.pbs
+   
+   # Flow-SR continuation (step 120k -> 220k):
+   qsub jobs/train_flow_continue.pbs
+   
+   # Autoregressive Flow:
+   qsub jobs/train_flow_ar.pbs
+   ```
+
+3. **Inference & Rollout**:
+   ```bash
+   qsub jobs/infer_flow_full_test_ab3pc75.pbs
+   qsub jobs/infer_flow_ar_test_year_ab2pc75.pbs
+   ```
+
+---
+
+## 4. Monitoring & Diagnostics
+
+- Check running jobs: `qstat -u $USER`
+- Inspect live job log: `tail -f logs/<job-name>.o<job-id>`
+- Check checkpoint status: `cat runs/<run_name>/status.json`
+- Loss curves and preview maps are automatically written to `runs/<run_name>/` during training.

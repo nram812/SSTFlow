@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -N srdn-b8
+#PBS -q h200q
+#PBS -l select=1:ncpus=16:mem=128GB:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:?submit from the SSTDownscaling root}"
+PYBIN="${PYBIN:-$PWD/SRDN/venv_srdn_gpu/bin/python}"
+MODEL="${MODEL:?set MODEL=srdcnn or resafno}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+MAX_STEPS="${MAX_STEPS:-300000}"
+OUTPUT_DIR="${OUTPUT_DIR:?set the separate batch-8 output directory}"
+RESUME_FROM="${RESUME_FROM:?set the source checkpoint prefix}"
+
+if [[ "$MODEL" == "resafno" ]]; then
+    CONFIG="configs/srdn_resafno.json"
+elif [[ "$MODEL" == "srdcnn" ]]; then
+    CONFIG="configs/srdn_srdcnn.json"
+else
+    echo "Unknown MODEL=$MODEL; expected srdcnn or resafno" >&2
+    exit 2
+fi
+if [[ ! -x "$PYBIN" ]]; then
+    echo "Missing GPU Python: $PYBIN" >&2
+    exit 2
+fi
+
+export PYTHONPATH="$PWD/SRDN"
+"$PYBIN" -u SRDN/train_srdn.py \
+    --config "$CONFIG" \
+    --device cuda \
+    --batch-size "$BATCH_SIZE" \
+    --max-steps "$MAX_STEPS" \
+    --output-dir "$OUTPUT_DIR" \
+    --resume-from "$RESUME_FROM"
+
+status="$($PYBIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
+    "$OUTPUT_DIR/status.json")"
+if [[ "$status" == "checkpointed" ]]; then
+    qsub -q h200q -v MODEL="$MODEL",BATCH_SIZE="$BATCH_SIZE",MAX_STEPS="$MAX_STEPS",OUTPUT_DIR="$OUTPUT_DIR",RESUME_FROM="$RESUME_FROM",PYBIN="$PYBIN" jobs/srdn_train_batch8.pbs
+fi
